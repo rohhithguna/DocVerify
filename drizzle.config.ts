@@ -1,14 +1,20 @@
 import { defineConfig } from "drizzle-kit";
 
-if (!process.env.DATABASE_URL) {
-  throw new Error("DATABASE_URL, ensure the database is provisioned");
+const databaseUrl = process.env.DATABASE_URL;
+
+if (!databaseUrl) {
+  console.warn(
+    "⚠️  DATABASE_URL not set. Run the following to push schema:\n" +
+    "   1. Set DATABASE_URL in .env (get one from https://neon.tech)\n" +
+    "   2. Run: npm run db:push"
+  );
 }
 
 export default defineConfig({
   out: "./migrations",
-  schema: "./shared/schema.ts",
+  schema: "./database/schema.ts",
   dialect: "postgresql",
   dbCredentials: {
-    url: process.env.DATABASE_URL,
+    url: databaseUrl || "postgresql://placeholder:placeholder@localhost:5432/placeholder",
   },
 });
