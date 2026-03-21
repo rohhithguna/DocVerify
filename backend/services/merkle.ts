@@ -1,4 +1,14 @@
 import { cryptoService } from "./crypto";
+import { MerkleTree as JsMerkleTree } from "merkletreejs";
+import keccak256 from "keccak256";
+
+type CertificateMetadata = {
+  name: string;
+  course: string;
+  issuer: string;
+  date: string;
+  certificateId: string;
+};
 
 export interface MerkleNode {
   hash: string;
@@ -10,127 +20,49 @@ export interface MerkleNode {
 
 export interface MerkleProof {
   leaf: string;
-  path: Array<{
-    hash: string;
-    direction: 'left' | 'right';
-  }>;
+  path: string[];
   root: string;
 }
 
 export class MerkleTree {
-  private root: MerkleNode | null = null;
-  private leaves: MerkleNode[] = [];
+  private tree: JsMerkleTree;
+  private leafMap: Map<string, Buffer>;
+  private root: string;
 
   constructor(data: string[]) {
-    this.buildTree(data);
-  }
-
-  private buildTree(data: string[]): void {
     if (data.length === 0) {
       throw new Error("Cannot build Merkle tree with empty data");
     }
 
-    // Create leaf nodes
-    this.leaves = data.map(item => ({
-      hash: cryptoService.computeHash(item),
-      isLeaf: true,
-      data: item,
-    }));
+    const leaves = data.map((hash) => keccak256(hash));
+    this.tree = new JsMerkleTree(leaves, keccak256, { sortPairs: true });
+    this.root = this.tree.getHexRoot();
 
-    // Build tree bottom-up
-    let currentLevel = [...this.leaves];
-
-    while (currentLevel.length > 1) {
-      const nextLevel: MerkleNode[] = [];
-
-      for (let i = 0; i < currentLevel.length; i += 2) {
-        const left = currentLevel[i];
-        const right = i + 1 < currentLevel.length ? currentLevel[i + 1] : left;
-
-        const combinedHash = cryptoService.computeHash(left.hash + right.hash);
-        const parentNode: MerkleNode = {
-          hash: combinedHash,
-          left,
-          right: right !== left ? right : undefined,
-          isLeaf: false,
-        };
-
-        nextLevel.push(parentNode);
-      }
-
-      currentLevel = nextLevel;
+    this.leafMap = new Map();
+    for (let i = 0; i < data.length; i++) {
+      this.leafMap.set(data[i], leaves[i]);
     }
-
-    this.root = currentLevel[0];
   }
 
   public getRoot(): string {
-    if (!this.root) {
-      throw new Error("Tree not built");
-    }
-    return this.root.hash;
+    return this.root;
   }
 
-  public generateProof(leafData: string): MerkleProof | null {
-    const leafHash = cryptoService.computeHash(leafData);
-    const leafNode = this.leaves.find(leaf => leaf.hash === leafHash);
-    
-    if (!leafNode) {
+  public generateProof(hash: string): MerkleProof | null {
+    const leaf = this.leafMap.get(hash);
+    if (!leaf) {
       return null;
     }
 
-    const proof: MerkleProof = {
-      leaf: leafHash,
-      path: [],
-      root: this.getRoot(),
+    return {
+      leaf: `0x${leaf.toString("hex")}`,
+      path: this.tree.getHexProof(leaf),
+      root: this.root,
     };
-
-    this.buildProofPath(this.root!, leafHash, proof.path);
-    return proof;
-  }
-
-  private buildProofPath(
-    node: MerkleNode, 
-    targetHash: string, 
-    path: Array<{ hash: string; direction: 'left' | 'right' }>
-  ): boolean {
-    if (!node) return false;
-
-    if (node.isLeaf) {
-      return node.hash === targetHash;
-    }
-
-    // Check left subtree
-    if (node.left && this.buildProofPath(node.left, targetHash, path)) {
-      if (node.right) {
-        path.push({ hash: node.right.hash, direction: 'right' });
-      }
-      return true;
-    }
-
-    // Check right subtree
-    if (node.right && this.buildProofPath(node.right, targetHash, path)) {
-      if (node.left) {
-        path.push({ hash: node.left.hash, direction: 'left' });
-      }
-      return true;
-    }
-
-    return false;
   }
 
   public static verifyProof(proof: MerkleProof): boolean {
-    let computedHash = proof.leaf;
-
-    for (const step of proof.path) {
-      if (step.direction === 'left') {
-        computedHash = cryptoService.computeHash(step.hash + computedHash);
-      } else {
-        computedHash = cryptoService.computeHash(computedHash + step.hash);
-      }
-    }
-
-    return computedHash === proof.root;
+    return JsMerkleTree.verify(proof.path, proof.leaf, proof.root, keccak256, { sortPairs: true });
   }
 
   public static groupDocuments(
@@ -171,8 +103,28 @@ export class MerkleTree {
   }
 }
 
+function generateCertificateMerkleBatch(certificates: CertificateMetadata[]) {
+  const normalized = certificates.map((metadata) =>
+    cryptoService.buildCanonicalCertificateData(metadata as Record<string, any>)
+  );
+  const hashes = normalized.map((metadata) => cryptoService.computeCertificateHash(metadata));
+  const leaves = hashes.map((hash) => keccak256(hash));
+  const tree = new JsMerkleTree(leaves, keccak256, { sortPairs: true });
+  const root = tree.getHexRoot();
+
+  return {
+    root,
+    certificates: normalized.map((metadata, index) => ({
+      metadata,
+      hash: hashes[index],
+      proof: tree.getHexProof(leaves[index]),
+    })),
+  };
+}
+
 export const merkleService = {
   createTree: (data: string[]) => new MerkleTree(data),
   verifyProof: MerkleTree.verifyProof,
   groupDocuments: MerkleTree.groupDocuments,
+  generateCertificateMerkleBatch,
 };

@@ -10,6 +10,40 @@
 export const DOCUTRUST_ABI = [
   // ── Core Functions ──────────────────────────────────────
 
+  // storeRoot(bytes32 root)
+  {
+    inputs: [{ name: "root", type: "bytes32" }],
+    name: "storeRoot",
+    outputs: [],
+    stateMutability: "nonpayable",
+    type: "function",
+  },
+
+  // verifyRoot(bytes32 root) → (bool, bool, address, uint256)
+  {
+    inputs: [{ name: "root", type: "bytes32" }],
+    name: "verifyRoot",
+    outputs: [
+      { name: "exists_", type: "bool" },
+      { name: "revoked_", type: "bool" },
+      { name: "issuer_", type: "address" },
+      { name: "timestamp_", type: "uint256" },
+    ],
+    stateMutability: "view",
+    type: "function",
+  },
+
+  // revokeRoot(bytes32 root)
+  {
+    inputs: [{ name: "root", type: "bytes32" }],
+    name: "revokeRoot",
+    outputs: [],
+    stateMutability: "nonpayable",
+    type: "function",
+  },
+
+  // Backward-compatible wrappers (operate on roots)
+
   // issueDocument(bytes32 docHash)
   {
     inputs: [{ name: "docHash", type: "bytes32" }],
@@ -82,6 +116,15 @@ export const DOCUTRUST_ABI = [
     type: "function",
   },
 
+  // validRoots(bytes32) → bool
+  {
+    inputs: [{ name: "", type: "bytes32" }],
+    name: "validRoots",
+    outputs: [{ name: "", type: "bool" }],
+    stateMutability: "view",
+    type: "function",
+  },
+
   // authorizedIssuers(address) → bool
   {
     inputs: [{ name: "", type: "address" }],
@@ -114,7 +157,7 @@ export const DOCUTRUST_ABI = [
       { indexed: true, name: "issuer", type: "address" },
       { indexed: false, name: "timestamp", type: "uint256" },
     ],
-    name: "DocumentIssued",
+    name: "RootStored",
     type: "event",
   },
 
@@ -125,7 +168,7 @@ export const DOCUTRUST_ABI = [
       { indexed: true, name: "revokedBy", type: "address" },
       { indexed: false, name: "timestamp", type: "uint256" },
     ],
-    name: "DocumentRevoked",
+    name: "RootRevoked",
     type: "event",
   },
 ] as const;

@@ -1,14 +1,15 @@
 import { useState } from "react";
-import { useLocation } from "wouter";
+import { useNavigate } from "react-router-dom";
 import { Shield, LogIn, UserPlus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/hooks/use-auth";
+import { useToast } from "@/hooks/use-toast";
 
 export default function LoginPage() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
   const { login } = useAuth();
   const [isLogin, setIsLogin] = useState(true);
   const [error, setError] = useState("");
@@ -21,8 +22,10 @@ export default function LoginPage() {
   // Register extra fields
   const [name, setName] = useState("");
   const [organization, setOrganization] = useState("");
+  const { toast } = useToast();
 
   const { register } = useAuth();
+  const isInfoMessage = error.toLowerCase().includes("successful");
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -31,7 +34,20 @@ export default function LoginPage() {
 
     try {
       if (isLogin) {
+        // Step 1: Login and wait for state updates
         await login(email, password);
+        
+        // Step 2: Show success toast
+        toast({
+          title: "Signed In",
+          description: "Welcome back. Redirecting to your dashboard.",
+        });
+        
+        // Step 3: Wait a bit for state to fully settle before redirect
+        await new Promise(resolve => setTimeout(resolve, 200));
+        
+        // Step 4: Now redirect (state is ready)
+        navigate("/dashboard");
       } else {
         if (!name.trim()) {
           setError("Name is required");
@@ -39,12 +55,32 @@ export default function LoginPage() {
           return;
         }
         await register({ email, password, name, organization });
+        setIsLogin(true);
+        setPassword("");
+        setError("Registration successful. Please sign in.");
+        toast({
+          title: "Account Created",
+          description: "Registration successful. You can now sign in.",
+        });
+        return;
       }
-      setLocation("/dashboard");
     } catch (err: any) {
-      setError(err.message || "Something went wrong");
-    } finally {
+      const message = err?.message || "Something went wrong";
+      setError(message);
+      toast({
+        title: isLogin ? "Sign-In Failed" : "Registration Failed",
+        description: message,
+        variant: "destructive",
+      });
+      // Ensure loading state is reset on error
       setLoading(false);
+    } finally {
+      // Only set loading to false if we didn't already in catch block
+      if (isLogin) {
+        // Loading will stay true during redirect, which is fine
+      } else {
+        setLoading(false);
+      }
     }
   };
 
@@ -73,6 +109,7 @@ export default function LoginPage() {
                     : "text-muted-foreground"
                 }`}
                 onClick={() => { setIsLogin(true); setError(""); }}
+                disabled={loading}
               >
                 <LogIn className="h-4 w-4" />
                 Sign In
@@ -84,6 +121,7 @@ export default function LoginPage() {
                     : "text-muted-foreground"
                 }`}
                 onClick={() => { setIsLogin(false); setError(""); }}
+                disabled={loading}
               >
                 <UserPlus className="h-4 w-4" />
                 Register
@@ -92,7 +130,9 @@ export default function LoginPage() {
 
             {/* Error */}
             {error && (
-              <div className="bg-destructive/10 text-destructive text-sm p-3 rounded-lg mb-4">
+              <div className={`text-sm p-3 rounded-lg mb-4 ${
+                isInfoMessage ? "bg-green-50 text-green-700 border border-green-200" : "bg-destructive/10 text-destructive"
+              }`}>
                 {error}
               </div>
             )}
@@ -108,6 +148,7 @@ export default function LoginPage() {
                       placeholder="John Doe"
                       value={name}
                       onChange={(e) => setName(e.target.value)}
+                      disabled={loading}
                       required={!isLogin}
                     />
                   </div>
@@ -118,6 +159,7 @@ export default function LoginPage() {
                       placeholder="MIT University"
                       value={organization}
                       onChange={(e) => setOrganization(e.target.value)}
+                      disabled={loading}
                     />
                   </div>
                 </>
@@ -131,6 +173,7 @@ export default function LoginPage() {
                   placeholder="admin@university.edu"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
+                  disabled={loading}
                   required
                 />
               </div>
@@ -143,6 +186,7 @@ export default function LoginPage() {
                   placeholder="••••••••"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
+                  disabled={loading}
                   required
                   minLength={6}
                 />
@@ -175,7 +219,7 @@ export default function LoginPage() {
         <div className="text-center mt-4">
           <Button
             variant="link"
-            onClick={() => setLocation("/verify")}
+            onClick={() => navigate("/verify")}
             className="text-muted-foreground"
           >
             Verify a document without logging in →

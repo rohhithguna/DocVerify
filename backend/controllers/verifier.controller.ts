@@ -3,191 +3,326 @@ import { storage } from "../storage";
 import { cryptoService } from "../services/crypto";
 import { merkleService } from "../services/merkle";
 import { blockchainService } from "../services/blockchain";
-import { asyncHandler, BadRequestError } from "../middleware/error-handler";
-import Papa from "papaparse";
-import type { VerifyBody } from "../middleware/validation";
+import { asyncHandler, AppError, BadRequestError } from "../middleware/error-handler";
+import jsQR from "jsqr";
+import { PNG } from "pngjs";
+import jpeg from "jpeg-js";
+import keccak256 from "keccak256";
+import type { VerifyBody, VerifyMetadataBody } from "../middleware/validation";
 
-// Verify document
-export const verifyDocument = asyncHandler(async (req: Request, res: Response) => {
-    if (!req.file) {
-        throw new BadRequestError("No file uploaded");
-    }
+type CertificateMetadata = {
+    name: string;
+    course: string;
+    issuer: string;
+    date: string;
+    certificateId: string;
+};
 
-    const { verifierId } = req.body as VerifyBody;
+function decodeQrDataFromImage(fileBuffer: Buffer, mimeType?: string): string {
+    let imageData: Uint8ClampedArray;
+    let width: number;
+    let height: number;
 
-    const fileName = req.file.originalname.toLowerCase();
-    const fileExtension = fileName.split('.').pop() || '';
-
-    let documentHash: string;
-    let verificationData: any = {};
-
-    // Handle different file types
-    if (fileExtension === 'csv') {
-        // CSV files - parse and hash the data
-        const csvContent = req.file.buffer.toString('utf-8');
-        const parseResult = Papa.parse(csvContent, {
-            header: true,
-            skipEmptyLines: true
-        });
-
-        if (parseResult.errors.length > 0) {
-            throw new BadRequestError(
-                `Invalid CSV format: ${parseResult.errors.map(e => `Line ${e.row ?? 0}: ${e.message}`).join('; ')}`
-            );
-        }
-
-        const csvData = parseResult.data as Record<string, any>[];
-
-        if (csvData.length === 0) {
-            throw new BadRequestError("CSV file is empty. Please upload a CSV file with at least one data row.");
-        }
-
-        // Process first row
-        const rowData = csvData[0];
-        const dataString = cryptoService.csvRowToDataString(rowData);
-        documentHash = cryptoService.computeHash(dataString);
-        verificationData = rowData;
+    if (mimeType?.includes("png")) {
+        const png = PNG.sync.read(fileBuffer);
+        width = png.width;
+        height = png.height;
+        imageData = new Uint8ClampedArray(png.data);
+    } else if (mimeType?.includes("jpeg") || mimeType?.includes("jpg")) {
+        const jpg = jpeg.decode(fileBuffer, { useTArray: true });
+        width = jpg.width;
+        height = jpg.height;
+        imageData = new Uint8ClampedArray(jpg.data);
     } else {
-        // PDF/Image files - hash the binary content directly
-        // For PNG/JPG images from certificates, we need to compute hash the same way
-        // as when the certificate was created (base64 of raw image data)
-        const base64Content = req.file.buffer.toString('base64');
-
-        // Compute hash same way as certificate creation (raw base64, no data URL prefix)
-        documentHash = cryptoService.computeHash(base64Content);
-
-        verificationData = {
-            fileName: req.file.originalname,
-            fileSize: req.file.size,
-            mimeType: req.file.mimetype,
-            fileType: fileExtension.toUpperCase()
-        };
-
-        console.log('[VERIFY] File type:', fileExtension);
-        console.log('[VERIFY] Computed hash from uploaded file (base64):', documentHash);
-        console.log('[VERIFY] File size:', req.file.size);
-        console.log('[VERIFY] Base64 length:', base64Content.length);
+        // Try PNG first, then JPEG as a fallback based on content.
+        try {
+            const png = PNG.sync.read(fileBuffer);
+            width = png.width;
+            height = png.height;
+            imageData = new Uint8ClampedArray(png.data);
+        } catch {
+            const jpg = jpeg.decode(fileBuffer, { useTArray: true });
+            width = jpg.width;
+            height = jpg.height;
+            imageData = new Uint8ClampedArray(jpg.data);
+        }
     }
 
-    // Create verification record
+    const qr = jsQR(imageData, width, height);
+    if (!qr?.data) {
+        throw new BadRequestError("QR code not found in certificate image");
+    }
+
+    return qr.data;
+}
+
+function extractCertificateIdFromVerifyUrl(qrData: string): string | null {
+    try {
+        const parsedUrl = new URL(qrData);
+        const pathMatch = parsedUrl.pathname.match(/\/verify\/([^/]+)$/i);
+        if (pathMatch?.[1]) {
+            return decodeURIComponent(pathMatch[1]);
+        }
+
+        const fromQuery = parsedUrl.searchParams.get("certificateId");
+        return fromQuery ? decodeURIComponent(fromQuery) : null;
+    } catch {
+        return null;
+    }
+}
+
+async function resolveCertificateMetadataFromQrData(qrData: string): Promise<CertificateMetadata> {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(qrData);
+    } catch {
+        parsed = null;
+    }
+
+    if (parsed) {
+        const certificateData = cryptoService.buildCanonicalCertificateData(parsed as Record<string, any>);
+        if (!certificateData.name || !certificateData.course || !certificateData.issuer || !certificateData.date || !certificateData.certificateId) {
+            throw new BadRequestError("QR metadata is missing required certificate fields");
+        }
+        return certificateData;
+    }
+
+    const certificateIdFromUrl = extractCertificateIdFromVerifyUrl(qrData);
+    if (!certificateIdFromUrl) {
+        throw new BadRequestError("Invalid QR payload format");
+    }
+
+    const normalizedCertificateId = certificateIdFromUrl.toUpperCase();
+    const matchedDocument =
+        await storage.getDocumentByCertificateId(certificateIdFromUrl) ||
+        await storage.getDocumentByCertificateId(normalizedCertificateId);
+
+    if (!matchedDocument) {
+        throw new BadRequestError("Certificate not found in system");
+    }
+
+    const metadata = cryptoService.buildCanonicalCertificateData(matchedDocument.originalData as Record<string, any>);
+    if (!metadata.name || !metadata.course || !metadata.issuer || !metadata.date || !metadata.certificateId) {
+        throw new BadRequestError("Certificate metadata is incomplete");
+    }
+
+    const certificateData = {
+        ...metadata,
+        certificateId: normalizedCertificateId,
+    };
+
+    return certificateData;
+}
+
+function hasRequiredCertificateData(data: { name: string; course: string; issuer: string; date: string; certificateId: string }): boolean {
+    return !!(data.name && data.course && data.issuer && data.date && data.certificateId);
+}
+
+async function performVerification(
+    verifierId: string,
+    sourceLabel: string,
+    certificateData: { name: string; course: string; issuer: string; date: string; certificateId: string },
+) {
+    const normalizedIssuer =
+        typeof certificateData.issuer === "string"
+            ? certificateData.issuer.trim()
+            : "";
+
+    if (typeof normalizedIssuer !== "string" || normalizedIssuer.length === 0) {
+        throw new BadRequestError("Invalid issuer format");
+    }
+
+    const canonicalCertificateData = {
+        ...certificateData,
+        issuer: normalizedIssuer,
+    };
+
+    const hashInput = cryptoService.certificateDataToHashString(canonicalCertificateData);
+    const verifyHash = cryptoService.computeHash(hashInput);
+
     const verification = await storage.createVerification({
         verifierId,
-        fileName: req.file.originalname,
-        documentHash,
+        fileName: sourceLabel,
+        documentHash: verifyHash,
         status: "pending",
-        verificationData,
+        verificationData: canonicalCertificateData,
     });
 
-    // Find matching document - first try by documentHash
-    let matchedDocument = await storage.getDocumentByHash(documentHash);
-    console.log('[VERIFY] Match by documentHash:', matchedDocument ? 'FOUND' : 'NOT FOUND');
+    const matchedDocument = await storage.getDocumentByCertificateId(canonicalCertificateData.certificateId);
+    const matchedCertificate = await storage.getCertificateByCertificateId(canonicalCertificateData.certificateId);
 
-    // If not found and it's an image file, try matching by imageHash
-    if (!matchedDocument && ['png', 'jpg', 'jpeg', 'webp'].includes(fileExtension)) {
-        console.log('[VERIFY] Trying to match by imageHash...');
-        matchedDocument = await storage.getDocumentByImageHash(documentHash);
-        console.log('[VERIFY] Match by imageHash:', matchedDocument ? 'FOUND' : 'NOT FOUND');
+    const issueHash = matchedDocument?.documentHash ?? null;
+    const hashMatched = issueHash === verifyHash;
+
+    const isInactiveCertificate = !!matchedCertificate && matchedCertificate.status !== "ACTIVE";
+    if (isInactiveCertificate) {
+        const updatedVerification = await storage.updateVerification(verification.id, {
+            digitalSignatureValid: false,
+            merkleProofValid: false,
+            blockchainVerified: false,
+            confidenceScore: 0,
+            matchedBatchId: matchedDocument?.batchId,
+            matchedDocumentId: matchedDocument?.id,
+            status: "failed",
+        });
+
+        return {
+            success: true,
+            status: "INVALID",
+            reason: "Certificate revoked or deleted",
+            isValid: false,
+            isRevoked: true,
+            confidence: 0,
+            message: "INVALID",
+            issueHash,
+            verifyHash,
+            verification: updatedVerification,
+            results: {
+                documentFound: !!matchedDocument,
+                isRevoked: true,
+                digitalSignatureValid: false,
+                merkleProofValid: false,
+                blockchainVerified: false,
+                confidenceScore: 0,
+                status: "INVALID",
+                hashMatched,
+                merkleRoot: matchedDocument?.merkleRoot || null,
+                blockchainRootExists: false,
+                directHashOnChain: false,
+                blockchain: {
+                    exists: false,
+                    revoked: false,
+                    issuer: "0x0",
+                    timestamp: 0,
+                },
+                matchedBatch: null,
+            },
+        };
     }
 
-    // Certificate-specific fallback: try to match by certificateId from filename
-    // Filename format: certificate-{recipientName}-{certificateId}.png
-    if (!matchedDocument && ['png', 'jpg', 'jpeg', 'webp'].includes(fileExtension)) {
-        const filenameMatch = fileName.match(/certificate-.*?-(CERT-[A-Z0-9-]+)\./i);
-        if (filenameMatch) {
-            const extractedCertId = filenameMatch[1];
-            console.log('[VERIFY] Trying to match by certificateId:', extractedCertId);
-            matchedDocument = await storage.getDocumentByCertificateId(extractedCertId);
-            console.log('[VERIFY] Match by certificateId:', matchedDocument ? 'FOUND' : 'NOT FOUND');
-        }
+    const isPendingBlockchain = !!matchedCertificate && matchedCertificate.blockchainStatus === "PENDING";
+    if (isPendingBlockchain) {
+        const updatedVerification = await storage.updateVerification(verification.id, {
+            digitalSignatureValid: false,
+            merkleProofValid: false,
+            blockchainVerified: false,
+            confidenceScore: 0,
+            matchedBatchId: matchedDocument?.batchId,
+            matchedDocumentId: matchedDocument?.id,
+            status: "pending",
+        });
+
+        return {
+            success: true,
+            status: "PARTIAL",
+            reason: "Blockchain confirmation pending",
+            isValid: false,
+            isRevoked: false,
+            confidence: 0,
+            message: "Blockchain confirmation pending",
+            issueHash,
+            verifyHash,
+            verification: updatedVerification,
+            results: {
+                documentFound: !!matchedDocument,
+                isRevoked: false,
+                digitalSignatureValid: false,
+                merkleProofValid: false,
+                blockchainVerified: false,
+                confidenceScore: 0,
+                status: "PARTIAL",
+                hashMatched,
+                merkleRoot: matchedDocument?.merkleRoot || null,
+                blockchainRootExists: false,
+                directHashOnChain: false,
+                blockchain: {
+                    exists: false,
+                    revoked: false,
+                    issuer: "0x0",
+                    timestamp: 0,
+                },
+                matchedBatch: null,
+            },
+        };
     }
 
-    let digitalSignatureValid = false;
-    let merkleProofValid = false;
-    let blockchainVerified = false;
-    let confidenceScore = 0;
     let matchedBatch = null;
+    let blockchainResult = {
+        exists: false,
+        revoked: false,
+        issuer: "0x0",
+        timestamp: 0,
+    };
 
     if (matchedDocument) {
-        // Verify digital signature
-        if (matchedDocument.digitalSignature) {
-            if (fileExtension === 'csv') {
-                const dataString = cryptoService.csvRowToDataString(verificationData);
-                digitalSignatureValid = cryptoService.verifySignature(
-                    dataString,
-                    matchedDocument.digitalSignature
-                );
-            } else {
-                const originalData = matchedDocument.originalData as Record<string, any>;
-                if (originalData && originalData.certificateId) {
-                    const { imageHash, ...certificateData } = originalData;
-                    const dataString = cryptoService.csvRowToDataString(certificateData);
-                    digitalSignatureValid = cryptoService.verifySignature(
-                        dataString,
-                        matchedDocument.digitalSignature
-                    );
-                    console.log('[VERIFY] Certificate signature verification using originalData');
-                } else {
-                    digitalSignatureValid = cryptoService.verifySignature(
-                        req.file.buffer.toString('base64'),
-                        matchedDocument.digitalSignature
-                    );
-                }
-            }
-        }
-
-        // Verify Merkle proof
-        if (matchedDocument.merkleProof) {
-            try {
-                merkleProofValid = merkleService.verifyProof(matchedDocument.merkleProof as any);
-            } catch (error) {
-                console.error('Merkle proof verification error:', error);
-                merkleProofValid = false;
-            }
-        }
-
-        // Get batch information
         matchedBatch = await storage.getDocumentBatch(matchedDocument.batchId);
-
-        // Check if revoked FIRST
-        const isRevoked = matchedBatch?.revoked === true;
-
-        // Verify against blockchain
-        if (matchedBatch?.blockchainTxHash && matchedBatch?.merkleRoot) {
-            blockchainVerified = await blockchainService.verifyMerkleRoot(
-                matchedBatch.merkleRoot,
-                matchedBatch.blockchainTxHash
-            );
-        }
-
-        // Calculate confidence score
-        if (isRevoked) {
-            // Revoked documents get 0 confidence
-            confidenceScore = 0;
-        } else {
-            let score = 0;
-            if (digitalSignatureValid) score += 40;
-            if (merkleProofValid) score += 30;
-            if (blockchainVerified) score += 30;
-            confidenceScore = score;
-        }
-    } else {
-        console.log(`Document hash ${documentHash} not found in database`);
     }
 
-    // Determine final status
-    const isRevoked = matchedBatch?.revoked === true;
-    let finalStatus: string;
-    if (!matchedDocument) {
-        finalStatus = 'not_found';
-    } else if (isRevoked) {
-        finalStatus = 'revoked';
-    } else if (confidenceScore >= 70) {
-        finalStatus = 'verified';
-    } else {
-        finalStatus = 'failed';
+    const storedProof = matchedDocument?.merkleProof as
+        | { leaf?: string; path?: unknown; root?: string }
+        | null
+        | undefined;
+    const proofPath = Array.isArray(storedProof?.path) ? storedProof?.path : [];
+    const proofRoot =
+        (typeof storedProof?.root === "string" && storedProof.root) ||
+        matchedBatch?.merkleRoot ||
+        null;
+
+    // Build leaf from recreated hash. Stage-1 singleton roots use raw hash with empty proof path.
+    const reconstructedLeaf =
+        proofPath.length === 0 && proofRoot === verifyHash
+            ? verifyHash
+            : `0x${keccak256(verifyHash).toString("hex")}`;
+
+    let merkleProofValid = false;
+    if (matchedDocument && proofRoot) {
+        try {
+            merkleProofValid = merkleService.verifyProof({
+                leaf: reconstructedLeaf,
+                path: proofPath as string[],
+                root: proofRoot,
+            });
+        } catch {
+            merkleProofValid = false;
+        }
     }
 
-    // Update verification record
+    const directHashBlockchain = await blockchainService.verifyDocument(verifyHash);
+    const blockchainRootExists = proofRoot
+        ? await blockchainService.rootExists(proofRoot)
+        : false;
+    const merkleRootBlockchain = proofRoot
+        ? await blockchainService.verifyMerkleRoot(proofRoot)
+        : blockchainResult;
+
+    // Prefer direct hash verification (Stage-6); keep Merkle-root fallback for older batches.
+    blockchainResult = directHashBlockchain.exists ? directHashBlockchain : merkleRootBlockchain;
+
+    const digitalSignatureValid = !!matchedDocument?.digitalSignature
+        ? cryptoService.verifySignature(hashInput, matchedDocument.digitalSignature)
+        : false;
+    const directHashChainValid = directHashBlockchain.exists && !directHashBlockchain.revoked;
+    const merkleChainValid = blockchainRootExists && !merkleRootBlockchain.revoked;
+    const blockchainVerified = directHashBlockchain.exists || blockchainRootExists;
+
+    const isRevoked = (blockchainResult.revoked || matchedBatch?.revoked === true) && blockchainVerified;
+    const isValid = !!matchedDocument && hashMatched && (directHashChainValid || (merkleProofValid && merkleChainValid)) && !isRevoked;
+    const isOrphaned = !matchedDocument && directHashBlockchain.exists;
+
+    let confidenceScore = 0;
+    if (isRevoked) confidenceScore = 0;
+    else if (isValid) confidenceScore = 100;
+    else if (isOrphaned) confidenceScore = 0;
+    else confidenceScore = merkleProofValid && blockchainRootExists ? 90 : 0;
+
+    const finalStatus = !matchedDocument
+        ? "failed"
+        : isRevoked
+            ? "failed"
+            : isValid
+                ? "verified"
+                : "failed";
+
     const updatedVerification = await storage.updateVerification(verification.id, {
         digitalSignatureValid,
         merkleProofValid,
@@ -198,7 +333,29 @@ export const verifyDocument = asyncHandler(async (req: Request, res: Response) =
         status: finalStatus,
     });
 
-    res.json({
+    const verificationStatus = !matchedDocument
+        ? (isOrphaned ? "ORPHANED" : "NOT_FOUND")
+        : isRevoked
+            ? "REVOKED"
+            : isValid
+                ? "VALID"
+                : "INVALID";
+
+    const message = verificationStatus === "ORPHANED"
+        ? "Certificate deleted from system but exists on blockchain"
+        : verificationStatus === "NOT_FOUND"
+            ? "Certificate not found (possibly deleted)"
+            : verificationStatus;
+
+    return {
+        success: true,
+        status: verificationStatus,
+        isValid,
+        isRevoked,
+        confidence: confidenceScore,
+        message,
+        issueHash,
+        verifyHash,
         verification: updatedVerification,
         results: {
             documentFound: !!matchedDocument,
@@ -207,16 +364,155 @@ export const verifyDocument = asyncHandler(async (req: Request, res: Response) =
             merkleProofValid,
             blockchainVerified,
             confidenceScore,
-            matchedBatch: matchedBatch ? {
-                id: matchedBatch.id,
-                batchName: matchedBatch.batchName,
-                issuerName: matchedBatch.issuerName,
-                createdAt: matchedBatch.createdAt,
-                revoked: matchedBatch.revoked,
-                revokedAt: matchedBatch.revokedAt,
-            } : null,
+            status: verificationStatus,
+            hashMatched,
+            merkleRoot: proofRoot,
+            blockchainRootExists,
+            directHashOnChain: directHashBlockchain.exists,
+            blockchain: {
+                exists: blockchainResult.exists,
+                revoked: blockchainResult.revoked,
+                issuer: blockchainResult.issuer,
+                timestamp: blockchainResult.timestamp,
+            },
+            matchedBatch: matchedBatch
+                ? {
+                    id: matchedBatch.id,
+                    batchName: matchedBatch.batchName,
+                    issuerName: matchedBatch.issuerName,
+                    createdAt: matchedBatch.createdAt,
+                    revoked: matchedBatch.revoked,
+                    revokedAt: matchedBatch.revokedAt,
+                }
+                : null,
         },
+    };
+}
+
+// Verify document
+export const verifyDocument = asyncHandler(async (req: Request, res: Response) => {
+    if (!req.file) {
+        throw new BadRequestError("No file uploaded");
+    }
+
+    const { verifierId } = req.body as VerifyBody;
+
+    const fileName = req.file.originalname;
+    const fileExtension = fileName.split('.').pop() || '';
+    const normalizedExtension = fileExtension.toLowerCase();
+    const mimeType = (req.file.mimetype || "").toLowerCase();
+
+    const isSupportedImage =
+        normalizedExtension === "png" ||
+        normalizedExtension === "jpg" ||
+        normalizedExtension === "jpeg";
+
+    if (!isSupportedImage) {
+        throw new BadRequestError("Unsupported file type. Verification accepts PNG, JPG, or JPEG only.");
+    }
+
+    if (!mimeType.includes("png") && !mimeType.includes("jpeg") && !mimeType.includes("jpg")) {
+        throw new BadRequestError("Invalid image upload. Provide a PNG or JPEG certificate image containing QR metadata.");
+    }
+
+    const qrData = decodeQrDataFromImage(req.file.buffer, req.file.mimetype);
+
+    const certificateIdFromUrl = extractCertificateIdFromVerifyUrl(qrData);
+    if (certificateIdFromUrl) {
+        const normalizedCertificateId = certificateIdFromUrl.toUpperCase();
+        const matchedDocument =
+            await storage.getDocumentByCertificateId(certificateIdFromUrl) ||
+            await storage.getDocumentByCertificateId(normalizedCertificateId);
+
+        if (!matchedDocument) {
+            return res.json({
+                success: true,
+                status: "NOT_FOUND",
+                isValid: false,
+                confidence: 0,
+                message: "Certificate not found (possibly deleted)",
+                results: {
+                    documentFound: false,
+                    isRevoked: false,
+                    digitalSignatureValid: false,
+                    merkleProofValid: false,
+                    blockchainVerified: false,
+                    confidenceScore: 0,
+                    status: "NOT_FOUND",
+                },
+            });
+        }
+    }
+
+    const certificateData = await resolveCertificateMetadataFromQrData(qrData);
+
+    const response = await performVerification(verifierId, req.file.originalname, certificateData);
+    res.json(response);
+});
+
+// Get certificate metadata by certificateId
+export const getCertificateById = asyncHandler(async (req: Request, res: Response) => {
+    const { certificateId } = req.params;
+    const normalizedCertificateId = decodeURIComponent(certificateId).toUpperCase();
+
+    const certificate =
+        await storage.getCertificateByCertificateId(certificateId) ||
+        await storage.getCertificateByCertificateId(normalizedCertificateId);
+
+    if (!certificate) {
+        throw new AppError("Certificate not found in system", 404, "NOT_FOUND");
+    }
+
+    const toDate = (value: Date | null) => {
+        if (!value) return null;
+        return value.toISOString().split("T")[0];
+    };
+
+    const document =
+        (certificate.documentId ? await storage.getDocument(certificate.documentId) : undefined) ||
+        await storage.getDocumentByCertificateId(certificate.certificateId) ||
+        await storage.getDocumentByCertificateId(normalizedCertificateId);
+
+    const effectiveStatus = document?.revoked ? "REVOKED" : certificate.status;
+    const effectiveHash = document?.hash || document?.documentHash || certificate.hash;
+    const effectiveIssuer = document?.issuer || certificate.issuerName;
+
+    res.json({
+        certificateId: certificate.certificateId,
+        holderName: certificate.holderName,
+        course: certificate.course,
+        issuer: effectiveIssuer,
+        issueDate: toDate(certificate.issueDate),
+        expiryDate: toDate(certificate.expiryDate),
+        status: effectiveStatus,
+        blockchainStatus: certificate.blockchainStatus,
+        hash: effectiveHash,
     });
+});
+
+// Verify using canonical certificate metadata (primary flow)
+export const verifyMetadata = asyncHandler(async (req: Request, res: Response) => {
+    const { verifierId, name, course, issuer, date, certificateId } = req.body as VerifyMetadataBody;
+
+    const certificateData = cryptoService.buildCanonicalCertificateData({
+        name,
+        course,
+        issuer,
+        date,
+        certificateId,
+    });
+
+    if (!hasRequiredCertificateData(certificateData)) {
+        throw new BadRequestError("Missing required certificate data for verification");
+    }
+
+    const response = await performVerification(
+        verifierId,
+        `metadata-${certificateId}.json`,
+        certificateData,
+    );
+
+    res.json(response);
 });
 
 // Get verifier history

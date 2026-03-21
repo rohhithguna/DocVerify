@@ -1,19 +1,22 @@
-import { useState } from "react";
+import { useState, useRef, useCallback } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { CloudUpload, FileText, Upload, CheckCircle, X } from "lucide-react";
-import { Button } from "@/components/ui/button";
+import { useToast } from "@/hooks/use-toast";
+import { apiRequestMultipart, queryClient } from "@/lib/queryClient";
+
+/* Issuer-mode UI components — only imported when needed */
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
-import { useToast } from "@/hooks/use-toast";
-import { apiRequestMultipart, queryClient } from "@/lib/queryClient";
 
 interface FileUploadProps {
   issuerId?: string;
   verifierId?: string;
   onUploadSuccess?: () => void;
   onVerificationComplete?: (verification: any) => void;
+  onVerificationError?: (message: string) => void;
   onUploadStart?: () => void;
+  onFilePreview?: (url: string | null) => void;
+  onFileSelected?: (fileName: string) => void;
 }
 
 export default function FileUpload({
@@ -21,18 +24,31 @@ export default function FileUpload({
   verifierId,
   onUploadSuccess,
   onVerificationComplete,
-  onUploadStart
+  onVerificationError,
+  onUploadStart,
+  onFilePreview,
+  onFileSelected,
 }: FileUploadProps) {
   const [file, setFile] = useState<File | null>(null);
   const [batchName, setBatchName] = useState("");
   const [groupingCriterion, setGroupingCriterion] = useState("");
   const [issuerName, setIssuerName] = useState("");
+  const [dragOver, setDragOver] = useState(false);
+  const [inlineStatusMessage, setInlineStatusMessage] = useState("");
+  const [inlineStatusType, setInlineStatusType] = useState<"idle" | "info" | "success" | "error">("idle");
+  const inputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
 
   const isIssuerMode = !!issuerId;
-  const isVerifierMode = !!verifierId;
+  const isVerifierMode = !isIssuerMode;
+  const activeVerifierId = verifierId || "guest";
 
-  // Upload mutation for issuer
+  const getErrorMessage = (error: unknown, fallback: string) => {
+    if (error instanceof Error && error.message.trim()) return error.message;
+    return fallback;
+  };
+
+  // ─── Mutations ───
   const uploadMutation = useMutation({
     mutationFn: async (formData: FormData) => {
       const response = await apiRequestMultipart('POST', '/api/issuer/upload', formData);
@@ -43,17 +59,12 @@ export default function FileUpload({
         title: "Upload Successful",
         description: `${data.documentsProcessed} documents processed and stored on blockchain`,
       });
-      // Invalidate issuer queries
       if (issuerId) {
         queryClient.invalidateQueries({ queryKey: ['/api/issuer', issuerId, 'batches'] });
         queryClient.invalidateQueries({ queryKey: ['/api/issuer', issuerId, 'stats'] });
       }
       queryClient.invalidateQueries({ queryKey: ['/api/blockchain/status'] });
-
-      setFile(null);
-      setBatchName("");
-      setGroupingCriterion("");
-      setIssuerName("");
+      clearFile();
       onUploadSuccess?.();
     },
     onError: (error: any) => {
@@ -65,213 +76,326 @@ export default function FileUpload({
     },
   });
 
-  // Verification mutation for verifier
   const verifyMutation = useMutation({
     mutationFn: async (formData: FormData) => {
       const response = await apiRequestMultipart('POST', '/api/verifier/verify', formData);
       return response.json();
     },
     onSuccess: (data) => {
+      const status = data?.status || data?.results?.status;
+      const isNotFound = status === "NOT_FOUND";
+      const isOrphaned = status === "ORPHANED";
       toast({
-        title: "Verification Complete",
-        description: `Document verified with ${data.results.confidenceScore}% confidence`,
+        title: isNotFound || isOrphaned ? "Invalid Certificate" : "Verification Complete",
+        description: isNotFound
+          ? "Certificate not found (possibly deleted). Confidence: 0%"
+          : isOrphaned
+            ? "Certificate deleted from system but exists on blockchain. Confidence: 0%"
+            : data?.results?.confidenceScore !== undefined
+              ? `Document verified with ${data.results.confidenceScore}% confidence`
+              : "Document verification completed successfully",
       });
-      // Invalidate verifier queries
-      if (verifierId) {
-        queryClient.invalidateQueries({ queryKey: ['/api/verifier', verifierId, 'history'] });
-        queryClient.invalidateQueries({ queryKey: ['/api/verifier', verifierId, 'stats'] });
+      if (activeVerifierId && activeVerifierId !== "guest") {
+        queryClient.invalidateQueries({ queryKey: ['/api/verifier', activeVerifierId, 'history'] });
+        queryClient.invalidateQueries({ queryKey: ['/api/verifier', activeVerifierId, 'stats'] });
       }
       queryClient.invalidateQueries({ queryKey: ['/api/activity/recent'] });
-
-      setFile(null);
+      setInlineStatusType(isNotFound || isOrphaned ? "error" : "success");
+      setInlineStatusMessage(
+        isNotFound
+          ? "Invalid certificate: not found in system."
+          : isOrphaned
+            ? "Certificate deleted from system but exists on blockchain."
+            : "Verification completed successfully."
+      );
       onVerificationComplete?.(data);
     },
-    onError: (error: any) => {
+    onError: (error: unknown) => {
+      const message = getErrorMessage(error, "Failed to verify document");
       toast({
         title: "Verification Failed",
-        description: error.message || "Failed to verify document",
+        description: message,
         variant: "destructive",
       });
+      setInlineStatusType("error");
+      setInlineStatusMessage(message);
+      onVerificationError?.(message);
     },
   });
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFile = e.target.files?.[0];
-    if (!selectedFile) return;
+  const verifyByQrMutation = useMutation({
+    mutationFn: async (selectedFile: File) => {
+      const formData = new FormData();
+      formData.append('file', selectedFile);
+      formData.append('verifierId', activeVerifierId);
+      const response = await apiRequestMultipart('POST', '/api/verifier/verify', formData);
+      return response.json();
+    },
+    onSuccess: (data) => {
+      const statusLabel = data.status || (data.isRevoked ? "REVOKED" : data.isValid ? "VALID" : "INVALID");
+      toast({
+        title: `Verification Complete: ${statusLabel}`,
+        description: data.message,
+      });
+      if (activeVerifierId && activeVerifierId !== "guest") {
+        queryClient.invalidateQueries({ queryKey: ['/api/verifier', activeVerifierId, 'history'] });
+        queryClient.invalidateQueries({ queryKey: ['/api/verifier', activeVerifierId, 'stats'] });
+      }
+      queryClient.invalidateQueries({ queryKey: ['/api/activity/recent'] });
+      setInlineStatusType(statusLabel === "NOT_FOUND" || statusLabel === "ORPHANED" ? "error" : "success");
+      setInlineStatusMessage(data?.message || `Verification result: ${statusLabel}`);
+      onVerificationComplete?.(data);
+    },
+    onError: (error: unknown) => {
+      const message = getErrorMessage(error, "Failed to verify certificate using QR metadata");
+      toast({
+        title: "Verification Failed",
+        description: message.includes("Certificate not found in system")
+          ? "Certificate not found in system"
+          : message,
+        variant: "destructive",
+      });
+      setInlineStatusType("error");
+      setInlineStatusMessage(message);
+      onVerificationError?.(message);
+    },
+  });
 
-    // Validate file size (FIX for BUG #11)
-    const maxSize = isIssuerMode ? 50 * 1024 * 1024 : 10 * 1024 * 1024; // 50MB or 10MB
+  // ─── File Handling ───
+  const clearFile = useCallback(() => {
+    setFile(null);
+    onFilePreview?.(null);
+    if (inputRef.current) inputRef.current.value = '';
+  }, [onFilePreview]);
+
+  const processFile = useCallback((selectedFile: File) => {
+    const maxSize = isIssuerMode ? 50 * 1024 * 1024 : 10 * 1024 * 1024;
     if (selectedFile.size > maxSize) {
       const maxSizeMB = maxSize / 1024 / 1024;
       toast({
         title: "File Too Large",
-        description: `File must be less than ${maxSizeMB}MB. Your file is ${(selectedFile.size / 1024 / 1024).toFixed(2)}MB`,
+        description: `File must be less than ${maxSizeMB}MB.`,
         variant: "destructive",
       });
-      // Clear the input
-      e.target.value = '';
       return;
     }
 
-    // Validate file type
     if (isIssuerMode && !selectedFile.name.endsWith('.csv')) {
       toast({
         title: "Invalid File Type",
         description: "Please upload a CSV file (.csv extension)",
         variant: "destructive",
       });
-      e.target.value = '';
       return;
     }
 
     setFile(selectedFile);
-  };
+    setInlineStatusType("info");
+    setInlineStatusMessage(isVerifierMode ? "Scanning document…" : "File selected.");
+
+    // Generate preview for images/PDFs
+    // Notify parent of selected file name
+    onFileSelected?.(selectedFile.name);
+
+    if (isVerifierMode && selectedFile.type.startsWith('image/')) {
+      const url = URL.createObjectURL(selectedFile);
+      onFilePreview?.(url);
+    } else {
+      onFilePreview?.(null);
+    }
+
+    if (isVerifierMode) {
+      onUploadStart?.();
+      verifyByQrMutation.mutate(selectedFile);
+    }
+  }, [isIssuerMode, isVerifierMode, toast, onFilePreview, onFileSelected, onUploadStart, verifyByQrMutation]);
+
+  const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFile = e.target.files?.[0];
+    if (selectedFile) processFile(selectedFile);
+  }, [processFile]);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    const droppedFile = e.dataTransfer.files[0];
+    if (droppedFile) processFile(droppedFile);
+  }, [processFile]);
 
   const handleSubmit = () => {
     if (!file) return;
-
     const formData = new FormData();
     formData.append('file', file);
 
     if (isIssuerMode) {
-      // Validate all required fields (FIX for BUG #10)
       if (!issuerId) {
-        toast({
-          title: "Configuration Error",
-          description: "Issuer ID is missing. Please try refreshing the page.",
-          variant: "destructive",
-        });
+        toast({ title: "Configuration Error", description: "Issuer ID is missing.", variant: "destructive" });
         return;
       }
-
       if (!batchName || !groupingCriterion || !issuerName) {
-        toast({
-          title: "Missing Information",
-          description: "Please fill in all required fields",
-          variant: "destructive",
-        });
+        toast({ title: "Missing Information", description: "Please fill in all required fields", variant: "destructive" });
         return;
       }
-
       formData.append('batchName', batchName);
       formData.append('issuerId', issuerId);
       formData.append('issuerName', issuerName);
       formData.append('groupingCriterion', groupingCriterion);
-
       onUploadStart?.();
       uploadMutation.mutate(formData);
     } else if (isVerifierMode) {
-      if (!verifierId) {
-        toast({
-          title: "Configuration Error",
-          description: "Verifier ID is missing. Please try refreshing the page.",
-          variant: "destructive",
-        });
-        return;
-      }
-
-      formData.append('verifierId', verifierId);
+      formData.append('verifierId', activeVerifierId);
       onUploadStart?.();
       verifyMutation.mutate(formData);
     }
   };
 
   const isProcessing = uploadMutation.isPending || verifyMutation.isPending;
+  const isAutoVerifying = verifyByQrMutation.isPending;
+  const isBusy = isProcessing || isAutoVerifying;
 
   return (
-    <div className="space-y-6">
-      {/* File Upload Zone */}
-      <div className="border-2 border-dashed border-border rounded-lg p-8 text-center hover:border-primary transition-colors">
-        <CloudUpload className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
-        <h3 className="text-lg font-medium text-foreground mb-2">
-          {isIssuerMode ? 'Upload CSV File' : 'Upload Document'}
-        </h3>
-        <p className="text-muted-foreground mb-4">
-          {isIssuerMode
-            ? 'Drag and drop your CSV file here or click to browse'
-            : 'Upload a document to verify its authenticity'
-          }
-        </p>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
 
+      {/* ─── Drop Zone ─── */}
+      <div
+        className={`drop-zone ${dragOver ? 'drag-over' : ''}`}
+        onClick={() => !isBusy && inputRef.current?.click()}
+        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={handleDrop}
+        style={{ padding: file ? '24px 32px' : '48px 32px' }}
+      >
         <input
+          ref={inputRef}
           type="file"
           id="file-upload"
-          className="hidden"
+          style={{ display: 'none' }}
           accept={isIssuerMode ? '.csv' : '.pdf,.jpg,.jpeg,.png'}
           onChange={handleFileChange}
           data-testid="input-file-upload"
         />
 
-        <Button asChild variant="outline" data-testid="button-choose-file">
-          <label htmlFor="file-upload" className="cursor-pointer">
-            <Upload className="h-4 w-4 mr-2" />
-            Choose File
-          </label>
-        </Button>
-
-        <p className="text-xs text-muted-foreground mt-2">
-          {isIssuerMode
-            ? 'Supports: .csv files up to 50MB'
-            : 'Supports: PDF, JPG, PNG files up to 10MB'
-          }
-        </p>
+        {file ? (
+          /* ─── Selected file ─── */
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 12,
+            width: '100%',
+          }}>
+            <div style={{
+              width: 36,
+              height: 36,
+              borderRadius: 8,
+              background: 'var(--secondary)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              flexShrink: 0,
+            }}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--muted-foreground)" strokeWidth="2">
+                <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" />
+                <polyline points="14 2 14 8 20 8" />
+              </svg>
+            </div>
+            <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
+              <div
+                style={{
+                  fontSize: 14,
+                  fontWeight: 500,
+                  color: 'var(--foreground)',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+                data-testid="text-selected-file"
+              >
+                {file.name}
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--muted-foreground)' }}>
+                {(file.size / 1024 / 1024).toFixed(2)} MB
+              </div>
+            </div>
+            {!isBusy && (
+              <button
+                onClick={(e) => { e.stopPropagation(); clearFile(); }}
+                className="btn-ghost"
+                style={{ padding: '6px 8px', fontSize: 12 }}
+                data-testid="button-remove-file"
+              >
+                Remove
+              </button>
+            )}
+          </div>
+        ) : (
+          /* ─── Empty state ─── */
+          <>
+            <svg
+              width="32" height="32" viewBox="0 0 24 24" fill="none"
+              stroke="var(--muted-foreground)" strokeWidth="1.5"
+              style={{ marginBottom: 12, opacity: 0.4 }}
+            >
+              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+              <polyline points="17 8 12 3 7 8" />
+              <line x1="12" y1="3" x2="12" y2="15" />
+            </svg>
+            <div style={{
+              fontSize: 14,
+              fontWeight: 500,
+              color: 'var(--foreground)',
+              marginBottom: 4,
+            }}>
+              {isIssuerMode ? 'Upload CSV File' : 'Drop your document here'}
+            </div>
+            <div style={{
+              fontSize: 13,
+              color: 'var(--muted-foreground)',
+              marginBottom: 16,
+            }}>
+              {isIssuerMode
+                ? 'Drag and drop or click to browse'
+                : 'PDF, JPG, or PNG — up to 10MB'}
+            </div>
+            <button
+              className="btn-primary"
+              onClick={(e) => { e.stopPropagation(); inputRef.current?.click(); }}
+              disabled={isBusy}
+              data-testid="button-choose-file"
+            >
+              {isBusy ? 'Please wait…' : 'Choose File'}
+            </button>
+          </>
+        )}
       </div>
 
-      {/* Selected File Display */}
-      {file && (
-        <div className="bg-accent rounded-lg p-4">
-          <div className="flex items-center space-x-3">
-            <FileText className="h-8 w-8 text-primary" />
-            <div className="flex-1">
-              <p className="font-medium text-accent-foreground" data-testid="text-selected-file">
-                {file.name}
-              </p>
-              <p className="text-sm text-muted-foreground">
-                {(file.size / 1024 / 1024).toFixed(2)} MB
-              </p>
-            </div>
-            <CheckCircle className="h-5 w-5 text-green-600" />
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setFile(null)}
-              className="h-8 w-8 p-0 text-muted-foreground hover:text-destructive"
-              data-testid="button-remove-file"
-            >
-              <X className="h-4 w-4" />
-            </Button>
-          </div>
-        </div>
-      )}
-
-      {/* Issuer Configuration */}
+      {/* ─── Issuer Configuration ─── */}
       {isIssuerMode && (
-        <div className="space-y-4">
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           <div>
             <Label htmlFor="issuer-name">Issuer Name</Label>
             <Input
               id="issuer-name"
               value={issuerName}
               onChange={(e) => setIssuerName(e.target.value)}
+              disabled={isBusy}
               placeholder="Enter your organization name"
               data-testid="input-issuer-name"
             />
           </div>
-
           <div>
             <Label htmlFor="batch-name">Batch Name</Label>
             <Input
               id="batch-name"
               value={batchName}
               onChange={(e) => setBatchName(e.target.value)}
+              disabled={isBusy}
               placeholder="Enter batch identifier"
               data-testid="input-batch-name"
             />
           </div>
-
           <div>
             <Label htmlFor="grouping-criterion">Grouping Criterion</Label>
-            <Select value={groupingCriterion} onValueChange={setGroupingCriterion}>
+            <Select value={groupingCriterion} onValueChange={setGroupingCriterion} disabled={isBusy}>
               <SelectTrigger data-testid="select-grouping-criterion">
                 <SelectValue placeholder="Select grouping method" />
               </SelectTrigger>
@@ -286,34 +410,64 @@ export default function FileUpload({
         </div>
       )}
 
-      {/* Submit Button */}
-      <Button
+      {/* ─── Submit Button ─── */}
+      <button
+        className="btn-primary"
         onClick={handleSubmit}
-        disabled={!file || isProcessing || (isIssuerMode && (!batchName || !groupingCriterion || !issuerName))}
-        className="w-full"
+        disabled={!file || isBusy || (isIssuerMode && (!batchName || !groupingCriterion || !issuerName))}
+        style={{ width: '100%', padding: '12px 24px' }}
         data-testid={isIssuerMode ? "button-process-sign" : "button-start-verification"}
       >
-        {isProcessing ? (
-          <div className="flex items-center space-x-2">
-            <div className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"></div>
-            <span>{isIssuerMode ? 'Processing...' : 'Verifying...'}</span>
-          </div>
+        {isBusy ? (
+          <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span
+              className="animate-spin"
+              style={{
+                width: 14,
+                height: 14,
+                border: '2px solid rgba(255,255,255,0.3)',
+                borderTopColor: '#fff',
+                borderRadius: '50%',
+                display: 'inline-block',
+              }}
+            />
+            {isIssuerMode ? 'Processing…' : 'Verifying…'}
+          </span>
         ) : (
-          <div className="flex items-center space-x-2">
-            {isIssuerMode ? (
-              <>
-                <Upload className="h-4 w-4" />
-                <span>Process & Sign</span>
-              </>
-            ) : (
-              <>
-                <CheckCircle className="h-4 w-4" />
-                <span>Start Verification</span>
-              </>
-            )}
-          </div>
+          isIssuerMode ? 'Process & Sign' : 'Run Manual Verification'
         )}
-      </Button>
+      </button>
+
+      {/* ─── Inline Status ─── */}
+      {isVerifierMode && inlineStatusType !== "idle" && (
+        <div
+          style={{
+            fontSize: 13,
+            padding: '12px 0',
+            color: inlineStatusType === 'error'
+              ? 'var(--invalid)'
+              : inlineStatusType === 'success'
+                ? 'var(--valid)'
+                : 'var(--muted-foreground)',
+          }}
+          data-testid="verification-inline-status"
+        >
+          {inlineStatusMessage}
+        </div>
+      )}
+
+      {isVerifierMode && (
+        <p style={{
+          fontSize: 12,
+          color: 'var(--muted-foreground)',
+          textAlign: 'center',
+          lineHeight: 1.5,
+        }}>
+          Upload automatically starts QR metadata verification.
+          <br />
+          Use the button above for manual re-check.
+        </p>
+      )}
     </div>
   );
 }

@@ -7,6 +7,61 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
+const SENSITIVE_KEYS = new Set([
+  "token",
+  "accessToken",
+  "refreshToken",
+  "password",
+  "passwordHash",
+  "signature",
+  "privateKey",
+  "secret",
+  "authorization",
+]);
+
+function redactSensitive(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(redactSensitive);
+  }
+
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const output: Record<string, unknown> = {};
+
+    for (const [key, nestedValue] of Object.entries(record)) {
+      output[key] = SENSITIVE_KEYS.has(key) ? "[REDACTED]" : redactSensitive(nestedValue);
+    }
+
+    return output;
+  }
+
+  return value;
+}
+
+function requireEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+  return value;
+}
+
+function validateEnvironment(): void {
+  requireEnv("DATABASE_URL");
+  requireEnv("JWT_SECRET");
+  requireEnv("SIGNING_PRIVATE_KEY");
+  requireEnv("SIGNING_PUBLIC_KEY");
+  requireEnv("BLOCKCHAIN_RPC_URL");
+  requireEnv("BLOCKCHAIN_PRIVATE_KEY");
+
+  const contractAddress = process.env.DOCUTRUST_CONTRACT_ADDRESS?.trim() || process.env.DOCTRUST_CONTRACT_ADDRESS?.trim();
+  if (!contractAddress) {
+    throw new Error("Missing required environment variable: DOCUTRUST_CONTRACT_ADDRESS (or DOCTRUST_CONTRACT_ADDRESS)");
+  }
+}
+
+validateEnvironment();
+
 app.use((req, res, next) => {
   const start = Date.now();
   const path = req.path;
@@ -23,7 +78,7 @@ app.use((req, res, next) => {
     if (path.startsWith("/api")) {
       let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
       if (capturedJsonResponse) {
-        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+        logLine += ` :: ${JSON.stringify(redactSensitive(capturedJsonResponse))}`;
       }
 
       if (logLine.length > 80) {
@@ -42,7 +97,10 @@ app.use((req, res, next) => {
 
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
     const status = err.status || err.statusCode || 500;
-    const message = err.message || "Internal Server Error";
+    const isProduction = process.env.NODE_ENV === "production";
+    const message = status >= 500 && isProduction
+      ? "Internal Server Error"
+      : (err.message || "Internal Server Error");
 
     // Log error for debugging
     console.error('Server error:', err);
@@ -50,7 +108,7 @@ app.use((req, res, next) => {
     // Send response - do NOT throw after this
     res.status(status).json({
       error: message,
-      ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
+      ...(process.env.NODE_ENV === "development" && { stack: err.stack })
     });
   });
 

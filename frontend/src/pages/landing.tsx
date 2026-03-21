@@ -1,11 +1,11 @@
-import { useLocation } from "wouter";
+import { useNavigate } from "react-router-dom";
 import { Shield, Upload, Search, Lock, Link, Gauge, LogIn } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { useAuth } from "@/hooks/use-auth";
 
 export default function LandingPage() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
   const { user } = useAuth();
 
   return (
@@ -24,12 +24,12 @@ export default function LandingPage() {
                   <span className="text-sm text-muted-foreground">
                     Welcome, {user.name}
                   </span>
-                  <Button onClick={() => setLocation("/dashboard")}>
+                  <Button onClick={() => navigate("/dashboard")}>
                     Dashboard
                   </Button>
                 </>
               ) : (
-                <Button onClick={() => setLocation("/login")}>
+                <Button onClick={() => navigate("/login")}>
                   <LogIn className="h-4 w-4 mr-2" />
                   Sign In
                 </Button>
@@ -83,7 +83,7 @@ export default function LandingPage() {
                   </div>
                 </div>
                 <Button
-                  onClick={() => setLocation(user ? "/dashboard" : "/login")}
+                  onClick={() => navigate(user ? "/dashboard" : "/login")}
                   className="w-full"
                 >
                   {user ? "Go to Dashboard" : "Sign In to Issue"}
@@ -121,7 +121,7 @@ export default function LandingPage() {
                   </div>
                 </div>
                 <Button
-                  onClick={() => setLocation("/verify")}
+                  onClick={() => navigate("/verify")}
                   className="w-full bg-green-600 hover:bg-green-700"
                 >
                   Verify a Document

@@ -54,7 +54,6 @@ export const revokeDocument = asyncHandler(async (req: AuthRequest, res: Respons
     console.error("[Revoke] Blockchain revocation failed:", error);
     return res.status(500).json({
       error: "Blockchain revocation failed",
-      details: error.message,
     });
   }
 
@@ -64,6 +63,17 @@ export const revokeDocument = asyncHandler(async (req: AuthRequest, res: Respons
     revokedAt: new Date(),
     status: "revoked",
   });
+
+  const docsInBatch = await storage.getDocumentsByBatch(batchId);
+  const revokedAt = new Date();
+  await Promise.all(
+    docsInBatch.map((doc) =>
+      storage.updateDocument(doc.id, {
+        revoked: true,
+        revokedAt,
+      })
+    )
+  );
 
   const updatedBatch = await storage.getDocumentBatch(batchId);
 

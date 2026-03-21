@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from "express";
-import { createHmac } from "crypto";
+import { createHmac, randomBytes, pbkdf2Sync } from "crypto";
 
 // ──────────────────────────────────────────────
 //  Types
@@ -20,8 +20,28 @@ export interface AuthRequest extends Request {
 //  Simple JWT Implementation (no external deps)
 // ──────────────────────────────────────────────
 
-const JWT_SECRET = process.env.JWT_SECRET || process.env.SESSION_SECRET || "docutrust-dev-secret";
+const JWT_SECRET_RAW = process.env.JWT_SECRET || process.env.SESSION_SECRET;
 const JWT_EXPIRY_HOURS = 24;
+
+if (!JWT_SECRET_RAW) {
+  throw new Error("JWT_SECRET is required and must be provided via environment variables");
+}
+
+if (JWT_SECRET_RAW === "default" || JWT_SECRET_RAW === "docutrust-dev-secret") {
+  throw new Error("JWT_SECRET must not use a default or development value");
+}
+
+const normalizedSecret = JWT_SECRET_RAW.toLowerCase();
+if (
+  JWT_SECRET_RAW.length < 32 ||
+  normalizedSecret.includes("change-in-production") ||
+  normalizedSecret.includes("replace-with") ||
+  normalizedSecret.includes("dev-secret")
+) {
+  throw new Error("JWT_SECRET is too weak. Use a strong random value (minimum 32 characters).");
+}
+
+const JWT_SECRET: string = JWT_SECRET_RAW;
 
 function base64url(str: string): string {
   return Buffer.from(str).toString("base64url");
@@ -96,10 +116,8 @@ const KEY_LENGTH = 64;
  * Hash a password with a random salt using PBKDF2.
  */
 export function hashPassword(password: string): string {
-  const salt = require("crypto").randomBytes(SALT_LENGTH).toString("hex");
-  const hash = require("crypto")
-    .pbkdf2Sync(password, salt, ITERATIONS, KEY_LENGTH, "sha512")
-    .toString("hex");
+  const salt = randomBytes(SALT_LENGTH).toString("hex");
+  const hash = pbkdf2Sync(password, salt, ITERATIONS, KEY_LENGTH, "sha512").toString("hex");
   return `${salt}:${hash}`;
 }
 
@@ -109,9 +127,7 @@ export function hashPassword(password: string): string {
 export function verifyPassword(password: string, storedHash: string): boolean {
   const [salt, hash] = storedHash.split(":");
   if (!salt || !hash) return false;
-  const computed = require("crypto")
-    .pbkdf2Sync(password, salt, ITERATIONS, KEY_LENGTH, "sha512")
-    .toString("hex");
+  const computed = pbkdf2Sync(password, salt, ITERATIONS, KEY_LENGTH, "sha512").toString("hex");
   return computed === hash;
 }
 
@@ -141,16 +157,3 @@ export function requireAuth(req: AuthRequest, res: Response, next: NextFunction)
   next();
 }
 
-/**
- * Middleware: Optionally parse JWT (don't reject if missing).
- */
-export function optionalAuth(req: AuthRequest, _res: Response, next: NextFunction) {
-  const authHeader = req.headers.authorization;
-
-  if (authHeader?.startsWith("Bearer ")) {
-    const token = authHeader.substring(7);
-    req.user = verifyToken(token) || undefined;
-  }
-
-  next();
-}

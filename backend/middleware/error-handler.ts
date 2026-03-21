@@ -63,24 +63,47 @@ export const errorHandler: ErrorRequestHandler = (
     // Handle known operational errors
     if (err instanceof AppError && err.isOperational) {
         return res.status(err.statusCode).json({
-            error: err.code,
+            success: false,
+            error: err.message,
+            code: err.code,
             message: err.message,
         });
     }
 
     // Handle Zod validation errors
     if (err.name === 'ZodError') {
+        const issues = (err as any).issues ?? [];
+        const missingFieldIssue = issues.find((issue: any) =>
+            issue?.code === "invalid_type" && issue?.received === "undefined"
+        );
+        const missingFieldPath = missingFieldIssue?.path?.join(".") || "unknown";
+        const missingFieldName = missingFieldIssue?.path?.[missingFieldIssue.path.length - 1] || missingFieldPath;
+
         return res.status(400).json({
-            error: "VALIDATION_ERROR",
-            message: "Invalid request data",
-            details: (err as any).issues,
+            success: false,
+            error: missingFieldIssue
+                ? `Missing field: ${missingFieldName}`
+                : "Invalid request data",
+            code: "VALIDATION_ERROR",
+            message: missingFieldIssue
+                ? `Missing field: ${missingFieldName}`
+                : "Invalid request data",
+            details: issues,
+            ...(missingFieldIssue
+                ? {
+                    field: missingFieldPath,
+                    missingField: missingFieldName,
+                }
+                : {}),
         });
     }
 
     // Handle multer errors (file upload)
     if (err.name === 'MulterError') {
         return res.status(400).json({
-            error: "FILE_UPLOAD_ERROR",
+            success: false,
+            error: err.message,
+            code: "FILE_UPLOAD_ERROR",
             message: err.message,
         });
     }
@@ -92,7 +115,9 @@ export const errorHandler: ErrorRequestHandler = (
         : err.message;
 
     return res.status(500).json({
-        error: "INTERNAL_ERROR",
+        success: false,
+        error: message,
+        code: "INTERNAL_ERROR",
         message,
     });
 };
@@ -100,7 +125,9 @@ export const errorHandler: ErrorRequestHandler = (
 // 404 handler for unknown routes
 export const notFoundHandler = (req: Request, res: Response) => {
     res.status(404).json({
-        error: "NOT_FOUND",
+        success: false,
+        error: `Route ${req.method} ${req.path} not found`,
+        code: "NOT_FOUND",
         message: `Route ${req.method} ${req.path} not found`,
     });
 };

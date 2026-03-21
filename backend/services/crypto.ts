@@ -1,5 +1,13 @@
 import { createHash, createSign, createVerify } from "crypto";
 
+export type CertificateHashInput = {
+  name: string;
+  course: string;
+  issuer: string;
+  date: string;
+  certificateId: string;
+};
+
 export class CryptoService {
   private static instance: CryptoService;
   private privateKey: string;
@@ -137,6 +145,60 @@ export class CryptoService {
     fields.headerLines = lines.filter(line => line.trim().length > 0);
 
     return fields;
+  }
+
+  /**
+   * Build canonical certificate data object used for both issuance and verification.
+   * Supports legacy field names to keep backward compatibility.
+   */
+  public buildCanonicalCertificateData(input: Record<string, any>): CertificateHashInput {
+    const name = String(input.name ?? input.recipientName ?? '').trim();
+    const course = String(input.course ?? input.eventName ?? '').trim();
+    const issuerSource = input.issuer ?? input.issuerName ?? '';
+    const issuer = (() => {
+      if (typeof issuerSource === 'string') {
+        return issuerSource.trim();
+      }
+
+      if (issuerSource && typeof issuerSource === 'object') {
+        const maybeName = (issuerSource as Record<string, unknown>).name;
+        const maybeIssuerName = (issuerSource as Record<string, unknown>).issuerName;
+
+        if (typeof maybeName === 'string') {
+          return maybeName.trim();
+        }
+
+        if (typeof maybeIssuerName === 'string') {
+          return maybeIssuerName.trim();
+        }
+      }
+
+      return '';
+    })();
+    const date = String(input.date ?? input.issueDate ?? '').trim();
+    const certificateId = String(input.certificateId ?? '').trim();
+
+    return {
+      name,
+      course,
+      issuer,
+      date,
+      certificateId,
+    };
+  }
+
+  /**
+   * Serialize certificate data for hashing/signing. This must stay identical everywhere.
+   */
+  public certificateDataToHashString(data: CertificateHashInput): string {
+    return JSON.stringify(data);
+  }
+
+  /**
+   * Compute certificate hash from canonical JSON data.
+   */
+  public computeCertificateHash(data: CertificateHashInput): string {
+    return this.computeHash(this.certificateDataToHashString(data));
   }
 }
 

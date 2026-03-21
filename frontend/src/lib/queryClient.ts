@@ -20,8 +20,23 @@ function buildHeaders(includeJson: boolean = false): Record<string, string> {
 
 async function throwIfResNotOk(res: Response) {
   if (!res.ok) {
-    const text = (await res.text()) || res.statusText;
-    throw new Error(`${res.status}: ${text}`);
+    let payload: any = null;
+    let text = "";
+
+    try {
+      payload = await res.clone().json();
+    } catch {
+      text = (await res.text()) || "";
+    }
+
+    const errorMessage =
+      payload?.error ||
+      payload?.message ||
+      text ||
+      res.statusText ||
+      "Request failed";
+
+    throw new Error(`${res.status}: ${errorMessage}`);
   }
 }
 

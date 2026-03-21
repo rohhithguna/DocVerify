@@ -1,11 +1,12 @@
 import type { Request, Response } from "express";
+import { compare, hash } from "bcryptjs";
 import { storage } from "../storage";
 import {
   createToken,
-  hashPassword,
-  verifyPassword,
   type AuthRequest,
 } from "../middleware/auth";
+
+const BCRYPT_ROUNDS = 12;
 
 /**
  * POST /api/auth/register
@@ -13,8 +14,9 @@ import {
 export async function register(req: Request, res: Response) {
   try {
     const { email, password, name, organization } = req.body;
+    const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
 
-    if (!email || !password || !name) {
+    if (!normalizedEmail || !password || !name) {
       return res.status(400).json({
         error: "Missing required fields",
         required: ["email", "password", "name"],
@@ -28,31 +30,23 @@ export async function register(req: Request, res: Response) {
     }
 
     // Check if email already exists
-    const existingUser = await storage.getUserByEmail(email);
+    const existingUser = await storage.getUserByEmail(normalizedEmail);
     if (existingUser) {
       return res.status(409).json({ error: "Email already registered" });
     }
 
     // Hash password and create user
-    const passwordHash = hashPassword(password);
+    const passwordHash = await hash(password, BCRYPT_ROUNDS);
     const user = await storage.createUser({
-      email,
+      email: normalizedEmail,
       passwordHash,
       name,
       organization: organization || null,
       role: "issuer",
     });
 
-    // Generate token
-    const token = createToken({
-      userId: user.id,
-      email: user.email,
-      name: user.name,
-      role: user.role,
-    });
-
-    res.status(201).json({
-      token,
+    return res.status(201).json({
+      message: "Registration successful",
       user: {
         id: user.id,
         email: user.email,
@@ -63,7 +57,10 @@ export async function register(req: Request, res: Response) {
     });
   } catch (error) {
     console.error("Registration error:", error);
-    res.status(500).json({ error: "Registration failed" });
+    if (typeof error === "object" && error !== null && "code" in error && (error as { code?: string }).code === "23505") {
+      return res.status(409).json({ error: "Email already registered" });
+    }
+    return res.status(500).json({ error: "Registration failed" });
   }
 }
 
@@ -73,21 +70,23 @@ export async function register(req: Request, res: Response) {
 export async function login(req: Request, res: Response) {
   try {
     const { email, password } = req.body;
+    const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
 
-    if (!email || !password) {
+    if (!normalizedEmail || !password) {
       return res.status(400).json({
         error: "Email and password are required",
       });
     }
 
     // Find user
-    const user = await storage.getUserByEmail(email);
+    const user = await storage.getUserByEmail(normalizedEmail);
     if (!user) {
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
     // Verify password
-    if (!verifyPassword(password, user.passwordHash)) {
+    const validPassword = await compare(password, user.passwordHash);
+    if (!validPassword) {
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
@@ -99,7 +98,7 @@ export async function login(req: Request, res: Response) {
       role: user.role,
     });
 
-    res.json({
+    return res.json({
       token,
       user: {
         id: user.id,
@@ -111,7 +110,7 @@ export async function login(req: Request, res: Response) {
     });
   } catch (error) {
     console.error("Login error:", error);
-    res.status(500).json({ error: "Login failed" });
+    return res.status(500).json({ error: "Login failed" });
   }
 }
 
@@ -129,7 +128,7 @@ export async function getMe(req: AuthRequest, res: Response) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    res.json({
+    return res.json({
       id: user.id,
       email: user.email,
       name: user.name,
@@ -138,6 +137,6 @@ export async function getMe(req: AuthRequest, res: Response) {
     });
   } catch (error) {
     console.error("Get user error:", error);
-    res.status(500).json({ error: "Failed to get user info" });
+    return res.status(500).json({ error: "Failed to get user info" });
   }
 }

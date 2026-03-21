@@ -14,7 +14,7 @@ module.exports = {
   },
 
   paths: {
-    sources: "./",           // contracts are in this folder
+    sources: "./src",        // contracts are in this folder
     tests: "./test",
     cache: "./cache",
     artifacts: "./artifacts",
@@ -23,6 +23,11 @@ module.exports = {
   networks: {
     // Local Hardhat node (for testing)
     hardhat: {},
+
+    // Local Hardhat node (persistent)
+    localhost: {
+      url: "http://127.0.0.1:8545",
+    },
 
     // Sepolia testnet (for demo deployment)
     sepolia: {

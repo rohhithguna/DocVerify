@@ -1,7 +1,25 @@
 import { sql } from "drizzle-orm";
-import { pgTable, text, varchar, integer, timestamp, boolean, jsonb } from "drizzle-orm/pg-core";
+import { pgTable, text, varchar, integer, timestamp, boolean, jsonb, pgEnum } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
+
+export const certificateLevelEnum = pgEnum("certificate_level", [
+  "Beginner",
+  "Intermediate",
+  "Advanced",
+]);
+
+export const certificateStatusEnum = pgEnum("certificate_status", [
+  "ACTIVE",
+  "REVOKED",
+  "DELETED",
+]);
+
+export const certificateBlockchainStatusEnum = pgEnum("certificate_blockchain_status", [
+  "CONFIRMED",
+  "PENDING",
+  "FAILED",
+]);
 
 // ──────────────────────────────────────────────
 //  Users (Authentication)
@@ -42,11 +60,58 @@ export const documentBatches = pgTable("document_batches", {
 export const documents = pgTable("documents", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
   batchId: varchar("batch_id").references(() => documentBatches.id).notNull(),
+  certificateId: text("certificate_id"),
+  name: text("name"),
+  course: text("course"),
+  issuer: text("issuer"),
+  date: text("date"),
+  issuedDate: text("issued_date"),
+  hash: text("hash"),
   documentHash: text("document_hash").notNull(),
   digitalSignature: text("digital_signature"),
+  merkleRoot: text("merkle_root"),
   originalData: jsonb("original_data").notNull(), // Store original CSV row data
   merkleProof: jsonb("merkle_proof"), // Store Merkle proof as JSON array
+  revoked: boolean("revoked").notNull().default(false),
+  revokedAt: timestamp("revoked_at"),
   createdAt: timestamp("created_at").default(sql`now()`).notNull(),
+});
+
+// Structured certificate records with strict holder/issuer/security metadata.
+export const certificates = pgTable("certificates", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  documentId: varchar("document_id").references(() => documents.id),
+
+  holderName: text("holder_name").notNull(),
+  studentId: text("student_id").notNull().unique(),
+  holderEmail: text("holder_email"),
+
+  certificateId: text("certificate_id").notNull().unique(),
+  course: text("course").notNull(),
+  level: certificateLevelEnum("level").notNull(),
+  duration: text("duration").notNull(),
+  grade: text("grade"),
+
+  issuerName: text("issuer_name").notNull(),
+  issuerId: text("issuer_id").notNull(),
+  issuerWallet: text("issuer_wallet").notNull(),
+
+  issueDate: timestamp("issue_date").notNull(),
+  expiryDate: timestamp("expiry_date").notNull(),
+  status: certificateStatusEnum("status").notNull().default("ACTIVE"),
+  blockchainStatus: certificateBlockchainStatusEnum("blockchain_status").notNull().default("PENDING"),
+
+  hash: text("hash").notNull(),
+  txHash: text("tx_hash"),
+  merkleRoot: text("merkle_root"),
+
+  signature: text("signature").notNull(),
+  signedBy: text("signed_by").notNull(),
+
+  qrCodeUrl: text("qr_code_url").notNull(),
+
+  createdAt: timestamp("created_at").default(sql`now()`).notNull(),
+  updatedAt: timestamp("updated_at").default(sql`now()`).notNull(),
 });
 
 // Verification attempts by verifiers
@@ -94,6 +159,12 @@ export const insertDocumentSchema = createInsertSchema(documents).omit({
   createdAt: true,
 });
 
+export const insertCertificateSchema = createInsertSchema(certificates).omit({
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+});
+
 export const insertVerificationSchema = createInsertSchema(verifications).omit({
   id: true,
   createdAt: true,
@@ -114,6 +185,9 @@ export type InsertDocumentBatch = z.infer<typeof insertDocumentBatchSchema>;
 export type Document = typeof documents.$inferSelect;
 export type InsertDocument = z.infer<typeof insertDocumentSchema>;
 
+export type Certificate = typeof certificates.$inferSelect;
+export type InsertCertificate = z.infer<typeof insertCertificateSchema>;
+
 export type Verification = typeof verifications.$inferSelect;
 export type InsertVerification = z.infer<typeof insertVerificationSchema>;
 
@@ -124,6 +198,8 @@ export type InsertBlockchainStatus = z.infer<typeof insertBlockchainStatusSchema
 export type DocumentBatchWithStats = DocumentBatch & {
   verificationCount: number;
   successRate: number;
+  documentId?: string;
+  blockchainStatus?: "CONFIRMED" | "PENDING" | "FAILED";
 };
 
 export type VerificationWithDetails = Verification & {

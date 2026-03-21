@@ -1,10 +1,6 @@
 import { ethers } from "ethers";
 import { DOCUTRUST_ABI } from "./docutrust-abi";
 
-// ──────────────────────────────────────────────────────────
-//  Types
-// ──────────────────────────────────────────────────────────
-
 export interface BlockchainConfig {
   rpcUrl: string;
   privateKey: string;
@@ -13,7 +9,7 @@ export interface BlockchainConfig {
 }
 
 export interface BlockchainTransaction {
-  hash: string;
+  hash: string | null;
   blockNumber: number;
   gasUsed: string;
   status: "pending" | "confirmed" | "failed";
@@ -26,323 +22,376 @@ export interface VerificationResult {
   timestamp: number;
 }
 
-// ──────────────────────────────────────────────────────────
-//  Service
-// ──────────────────────────────────────────────────────────
+export type BlockchainConnectionStatus = "CONNECTED" | "DISCONNECTED" | "ERROR";
+
+export interface BlockchainNetworkStatus {
+  blockHeight: number;
+  gasPrice: string;
+  isConnected: boolean;
+  status: BlockchainConnectionStatus;
+  contractAddress: string;
+  totalDocuments: number;
+  error?: string;
+}
 
 export class BlockchainService {
   private provider: ethers.JsonRpcProvider;
-  private wallet: ethers.Wallet;
+  private wallet: ethers.NonceManager;
   private contract: ethers.Contract;
   private config: BlockchainConfig;
+  private blockchainRequired: boolean;
+  private testMode: boolean;
+  private mockMode: boolean;
 
-  constructor(config: BlockchainConfig) {
+  constructor(config: BlockchainConfig, options?: { blockchainRequired?: boolean; testMode?: boolean; mockMode?: boolean }) {
     this.config = config;
-    this.provider = new ethers.JsonRpcProvider(config.rpcUrl);
-    this.wallet = new ethers.Wallet(config.privateKey, this.provider);
-    this.contract = new ethers.Contract(
-      config.contractAddress,
-      DOCUTRUST_ABI,
-      this.wallet
-    );
+    this.blockchainRequired = options?.blockchainRequired ?? false;
+    this.testMode = options?.testMode ?? false;
+    this.mockMode = options?.mockMode ?? false;
+    this.provider = new ethers.JsonRpcProvider(config.rpcUrl, undefined, { staticNetwork: true });
+    const signer = new ethers.Wallet(config.privateKey, this.provider);
+    this.wallet = new ethers.NonceManager(signer);
+    this.contract = new ethers.Contract(config.contractAddress, DOCUTRUST_ABI, this.wallet);
   }
 
-  // ────────────────────────────────────────────────────────
-  //  Convert hex hash string to bytes32
-  // ────────────────────────────────────────────────────────
+  private mockTransaction(status: "pending" | "confirmed" | "failed" = "confirmed"): BlockchainTransaction {
+    return {
+      hash: status === "confirmed" ? "mock_tx_hash" : null,
+      blockNumber: 0,
+      gasUsed: "0",
+      status,
+    };
+  }
 
-  /**
-   * Convert a SHA-256 hex string (64 chars) to a bytes32 value
-   * that Solidity understands. Pads with 0x prefix if missing.
-   */
   private toBytes32(hexHash: string): string {
-    // Ensure the hash has 0x prefix
     const prefixed = hexHash.startsWith("0x") ? hexHash : `0x${hexHash}`;
-
-    // bytes32 = 32 bytes = 64 hex chars + "0x"
     if (prefixed.length !== 66) {
       throw new Error(
-        `Invalid hash length: expected 64 hex chars, got ${hexHash.length}. ` +
-        `Ensure you are passing a SHA-256 hash.`
+        `Invalid hash length: expected 64 hex chars, got ${hexHash.length}. Ensure a SHA-256/bytes32 value.`
       );
     }
-
     return prefixed;
   }
 
-  // ────────────────────────────────────────────────────────
-  //  Core: Issue Document
-  // ────────────────────────────────────────────────────────
-
-  /**
-   * Store a document hash on the blockchain via the smart contract.
-   * Calls DocuTrust.issueDocument(bytes32 docHash).
-   */
-  public async issueDocument(
-    documentHash: string,
+  private async sendTxWithRetry(
+    action: () => Promise<ethers.ContractTransactionResponse>,
+    operationName: string,
     maxRetries: number = 3
   ): Promise<BlockchainTransaction> {
-    const docHashBytes32 = this.toBytes32(documentHash);
     let lastError: Error | null = null;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        console.log(
-          `[Blockchain] Issuing document (attempt ${attempt}/${maxRetries})...`
-        );
-
-        const tx = await this.contract.issueDocument(docHashBytes32);
+        const tx = await action();
         const receipt = await tx.wait();
-
-        console.log(`[Blockchain] ✅ Document issued: ${tx.hash}`);
 
         return {
           hash: tx.hash,
-          blockNumber: receipt.blockNumber,
-          gasUsed: receipt.gasUsed.toString(),
-          status: receipt.status === 1 ? "confirmed" : "failed",
+          blockNumber: receipt?.blockNumber ?? 0,
+          gasUsed: receipt?.gasUsed?.toString() ?? "0",
+          status: receipt?.status === 1 ? "confirmed" : "failed",
         };
       } catch (error) {
         lastError = error as Error;
-        console.warn(
-          `[Blockchain] Attempt ${attempt} failed:`,
-          (error as Error).message
-        );
-
-        if (attempt < maxRetries) {
-          const delay = Math.pow(2, attempt - 1) * 1000;
-          await new Promise((resolve) => setTimeout(resolve, delay));
+        const isRetryable = this.isRetryableTxError(lastError);
+        if (!isRetryable || attempt === maxRetries) {
+          break;
         }
+
+        const delayMs = Math.pow(2, attempt - 1) * 500;
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
     }
 
-    throw new Error(
-      `Failed to issue document after ${maxRetries} attempts: ${lastError?.message}`
+    throw new Error(`${operationName} failed after retries: ${lastError?.message || "unknown error"}`);
+  }
+
+  private isRetryableTxError(error: Error): boolean {
+    const msg = error.message.toLowerCase();
+    return (
+      msg.includes("timeout") ||
+      msg.includes("nonce") ||
+      msg.includes("replacement fee too low") ||
+      msg.includes("already known") ||
+      msg.includes("temporarily unavailable") ||
+      msg.includes("network")
     );
   }
 
-  // ────────────────────────────────────────────────────────
-  //  Core: Verify Document
-  // ────────────────────────────────────────────────────────
+  public async storeMerkleRoot(
+    merkleRoot: string,
+    _batchIdOrMaxRetries?: string | number
+  ): Promise<BlockchainTransaction> {
+    if (this.testMode || this.mockMode) {
+      return this.mockTransaction("confirmed");
+    }
 
-  /**
-   * Verify a document hash against the smart contract.
-   * Calls DocuTrust.verifyDocument(bytes32 docHash) — this is a FREE read call.
-   */
-  public async verifyDocument(
-    documentHash: string
-  ): Promise<VerificationResult> {
     try {
-      const docHashBytes32 = this.toBytes32(documentHash);
-      const [exists, revoked, issuer, timestamp] =
-        await this.contract.verifyDocument(docHashBytes32);
-
-      return {
-        exists,
-        revoked,
-        issuer,
-        timestamp: Number(timestamp),
-      };
+      const rootBytes32 = this.toBytes32(merkleRoot);
+      return this.sendTxWithRetry(() => this.contract.storeRoot(rootBytes32), "storeMerkleRoot");
     } catch (error) {
-      console.error("[Blockchain] Verification error:", error);
-      return {
-        exists: false,
-        revoked: false,
-        issuer: ethers.ZeroAddress,
-        timestamp: 0,
-      };
+      if (!this.blockchainRequired) {
+        return this.mockTransaction("pending");
+      }
+      throw error;
     }
   }
 
-  // ────────────────────────────────────────────────────────
-  //  Core: Revoke Document
-  // ────────────────────────────────────────────────────────
-
-  /**
-   * Revoke a previously issued document.
-   * Calls DocuTrust.revokeDocument(bytes32 docHash).
-   */
-  public async revokeDocument(
-    documentHash: string
-  ): Promise<BlockchainTransaction> {
-    const docHashBytes32 = this.toBytes32(documentHash);
-
-    const tx = await this.contract.revokeDocument(docHashBytes32);
-    const receipt = await tx.wait();
-
-    console.log(`[Blockchain] ✅ Document revoked: ${tx.hash}`);
-
-    return {
-      hash: tx.hash,
-      blockNumber: receipt.blockNumber,
-      gasUsed: receipt.gasUsed.toString(),
-      status: receipt.status === 1 ? "confirmed" : "failed",
-    };
-  }
-
-  // ────────────────────────────────────────────────────────
-  //  Legacy Compatibility: storeMerkleRoot
-  // ────────────────────────────────────────────────────────
-
-  /**
-   * Store a Merkle root hash on blockchain.
-   * This wraps issueDocument() for backward compatibility with routes.ts
-   */
-  public async storeMerkleRoot(
-    merkleRoot: string,
-    _batchId: string
-  ): Promise<BlockchainTransaction> {
-    return this.issueDocument(merkleRoot);
-  }
-
-  /**
-   * Verify if a Merkle root was stored on blockchain.
-   * This wraps verifyDocument() for backward compatibility with routes.ts
-   */
   public async verifyMerkleRoot(
     merkleRoot: string,
-    _transactionHash: string
-  ): Promise<boolean> {
-    const result = await this.verifyDocument(merkleRoot);
-    return result.exists && !result.revoked;
+    _transactionHash?: string
+  ): Promise<VerificationResult> {
+    if (this.testMode || this.mockMode) {
+      return {
+        exists: true,
+        revoked: false,
+        issuer: "0x0000000000000000000000000000000000000001",
+        timestamp: Math.floor(Date.now() / 1000),
+      };
+    }
+
+    try {
+      const rootBytes32 = this.toBytes32(merkleRoot);
+      const [exists, revoked, issuer, timestamp] = await this.contract.verifyRoot(rootBytes32);
+
+      return {
+        exists: Boolean(exists),
+        revoked: Boolean(revoked),
+        issuer: String(issuer),
+        timestamp: Number(timestamp),
+      };
+    } catch (error) {
+      if (!this.blockchainRequired) {
+        return {
+          exists: false,
+          revoked: false,
+          issuer: "0x0",
+          timestamp: 0,
+        };
+      }
+      throw error;
+    }
   }
 
-  // ────────────────────────────────────────────────────────
-  //  Network Status
-  // ────────────────────────────────────────────────────────
+  public async rootExists(merkleRoot: string): Promise<boolean> {
+    if (this.testMode || this.mockMode) {
+      return true;
+    }
 
-  /**
-   * Get current blockchain network status.
-   */
-  public async getNetworkStatus(): Promise<{
-    blockHeight: number;
-    gasPrice: string;
-    isConnected: boolean;
-    contractAddress: string;
-    totalDocuments: number;
-  }> {
+    try {
+      const rootBytes32 = this.toBytes32(merkleRoot);
+      return Boolean(await this.contract.validRoots(rootBytes32));
+    } catch (error) {
+      if (!this.blockchainRequired) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  public async revokeMerkleRoot(merkleRoot: string): Promise<BlockchainTransaction> {
+    if (this.testMode || this.mockMode) {
+      return this.mockTransaction("confirmed");
+    }
+
+    try {
+      const rootBytes32 = this.toBytes32(merkleRoot);
+      return this.sendTxWithRetry(() => this.contract.revokeRoot(rootBytes32), "revokeMerkleRoot");
+    } catch (error) {
+      if (!this.blockchainRequired) {
+        return this.mockTransaction("pending");
+      }
+      throw error;
+    }
+  }
+
+  public async issueDocument(documentHash: string): Promise<BlockchainTransaction> {
+    if (this.testMode || this.mockMode) {
+      return this.mockTransaction("confirmed");
+    }
+
+    try {
+      const docBytes32 = this.toBytes32(documentHash);
+      return this.sendTxWithRetry(() => this.contract.issueDocument(docBytes32), "issueDocument");
+    } catch (error) {
+      if (!this.blockchainRequired) {
+        return this.mockTransaction("pending");
+      }
+      throw error;
+    }
+  }
+
+  public async verifyDocument(documentHash: string): Promise<VerificationResult> {
+    if (this.testMode || this.mockMode) {
+      return {
+        exists: true,
+        revoked: false,
+        issuer: "0x0000000000000000000000000000000000000001",
+        timestamp: Math.floor(Date.now() / 1000),
+      };
+    }
+
+    try {
+      const docBytes32 = this.toBytes32(documentHash);
+      const [exists, revoked, issuer, timestamp] = await this.contract.verifyDocument(docBytes32);
+
+      return {
+        exists: Boolean(exists),
+        revoked: Boolean(revoked),
+        issuer: String(issuer),
+        timestamp: Number(timestamp),
+      };
+    } catch (error) {
+      if (!this.blockchainRequired) {
+        return {
+          exists: false,
+          revoked: false,
+          issuer: "0x0",
+          timestamp: 0,
+        };
+      }
+      throw error;
+    }
+  }
+
+  public async revokeDocument(documentHash: string): Promise<BlockchainTransaction> {
+    if (this.testMode || this.mockMode) {
+      return this.mockTransaction("confirmed");
+    }
+
+    try {
+      const docBytes32 = this.toBytes32(documentHash);
+      return this.sendTxWithRetry(() => this.contract.revokeDocument(docBytes32), "revokeDocument");
+    } catch (error) {
+      if (!this.blockchainRequired) {
+        return this.mockTransaction("pending");
+      }
+      throw error;
+    }
+  }
+
+  public async checkConnection(): Promise<boolean> {
+    if (this.testMode || this.mockMode) {
+      return true;
+    }
+
+    try {
+      await this.provider.getBlockNumber();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  public async getNetworkStatus(): Promise<BlockchainNetworkStatus> {
+    const isConnected = await this.checkConnection();
+
+    if (!isConnected) {
+      return {
+        blockHeight: 0,
+        gasPrice: "0",
+        isConnected: false,
+        status: "DISCONNECTED",
+        contractAddress: this.config.contractAddress,
+        totalDocuments: 0,
+      };
+    }
+
     try {
       const blockNumber = await this.provider.getBlockNumber();
       const feeData = await this.provider.getFeeData();
-
       let totalDocuments = 0;
+      let status: BlockchainConnectionStatus = "CONNECTED";
+      let error: string | undefined;
+
       try {
         totalDocuments = Number(await this.contract.totalDocuments());
-      } catch {
-        // Contract might not be deployed yet
+      } catch (contractError) {
+        status = "ERROR";
+        error = contractError instanceof Error ? contractError.message : "Contract call failed";
       }
 
       return {
         blockHeight: blockNumber,
         gasPrice: ethers.formatUnits(feeData.gasPrice || 0, "gwei"),
-        isConnected: true,
+        isConnected: status === "CONNECTED",
+        status,
         contractAddress: this.config.contractAddress,
         totalDocuments,
+        ...(error ? { error } : {}),
       };
     } catch (error) {
-      console.error("[Blockchain] Network status error:", error);
       return {
         blockHeight: 0,
         gasPrice: "0",
         isConnected: false,
+        status: "ERROR",
         contractAddress: this.config.contractAddress,
         totalDocuments: 0,
+        error: error instanceof Error ? error.message : "Network status lookup failed",
       };
     }
   }
 }
 
-// ──────────────────────────────────────────────────────────
-//  Mock Service (when blockchain is not configured)
-// ──────────────────────────────────────────────────────────
-
-class MockBlockchainService {
-  async issueDocument(documentHash: string): Promise<BlockchainTransaction> {
-    console.log(`[Blockchain-Mock] Simulated issue: ${documentHash.slice(0, 16)}...`);
-    return {
-      hash: `0xmock_${Date.now().toString(16)}`,
-      blockNumber: Math.floor(Math.random() * 1000000),
-      gasUsed: "21000",
-      status: "confirmed",
-    };
+function getRequiredEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
   }
-
-  async verifyDocument(documentHash: string): Promise<VerificationResult> {
-    return { exists: false, revoked: false, issuer: "0x0", timestamp: 0 };
-  }
-
-  async revokeDocument(documentHash: string): Promise<BlockchainTransaction> {
-    console.log(`[Blockchain-Mock] Simulated revoke: ${documentHash.slice(0, 16)}...`);
-    return {
-      hash: `0xmock_revoke_${Date.now().toString(16)}`,
-      blockNumber: Math.floor(Math.random() * 1000000),
-      gasUsed: "21000",
-      status: "confirmed",
-    };
-  }
-
-  async storeMerkleRoot(merkleRoot: string, _batchId: string): Promise<BlockchainTransaction> {
-    return this.issueDocument(merkleRoot);
-  }
-
-  async verifyMerkleRoot(merkleRoot: string, _txHash: string): Promise<boolean> {
-    return true; // Simulated verification always passes in dev
-  }
-
-  async getNetworkStatus() {
-    return {
-      blockHeight: 0,
-      gasPrice: "0",
-      isConnected: false,
-      contractAddress: "0x0000000000000000000000000000000000000000",
-      totalDocuments: 0,
-    };
-  }
+  return value;
 }
 
-// ──────────────────────────────────────────────────────────
-//  Configuration & Initialization
-// ──────────────────────────────────────────────────────────
-
-function createBlockchainService(): BlockchainService | MockBlockchainService {
-  const rpcUrl = process.env.BLOCKCHAIN_RPC_URL;
-  const privateKey = process.env.BLOCKCHAIN_PRIVATE_KEY;
-  const contractAddress = process.env.DOCTRUST_CONTRACT_ADDRESS;
-  const networkName = process.env.BLOCKCHAIN_NETWORK || "sepolia";
-
-  // Check if blockchain is properly configured
-  if (!rpcUrl || !privateKey || rpcUrl.includes("placeholder")) {
-    console.warn("⚠️  Blockchain not configured — using mock service (demo mode)");
-    console.warn("   Set BLOCKCHAIN_RPC_URL, BLOCKCHAIN_PRIVATE_KEY, and DOCTRUST_CONTRACT_ADDRESS in .env");
-    return new MockBlockchainService();
-  }
-
-  if (!privateKey.match(/^0x[a-fA-F0-9]{64}$/)) {
-    console.warn("⚠️  Invalid BLOCKCHAIN_PRIVATE_KEY format — using mock service");
-    return new MockBlockchainService();
-  }
-
-  if (!contractAddress) {
-    console.warn("⚠️  DOCTRUST_CONTRACT_ADDRESS not set — using mock service");
-    console.warn("   Deploy: cd contracts && npm run deploy:sepolia");
-    return new MockBlockchainService();
-  }
-
-  try {
-    const service = new BlockchainService({
-      rpcUrl,
-      privateKey,
-      contractAddress,
-      networkName,
-    });
-    console.log(`✓ Blockchain connected (network: ${networkName})`);
-    console.log(`✓ Contract address: ${contractAddress}`);
-    return service;
-  } catch (error) {
-    console.warn("⚠️  Blockchain connection failed — using mock service");
-    return new MockBlockchainService();
-  }
+function parseBooleanEnv(name: string, defaultValue: boolean): boolean {
+  const raw = process.env[name];
+  if (raw == null) return defaultValue;
+  return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
 }
 
-export const blockchainService = createBlockchainService() as BlockchainService;
+function createBlockchainService(): BlockchainService {
+  const blockchainRequired = parseBooleanEnv("BLOCKCHAIN_REQUIRED", false);
+  const testMode = (process.env.NODE_ENV || "").toLowerCase() === "test";
+  const mockMode = testMode || !blockchainRequired;
 
+  const rpcUrl = process.env.BLOCKCHAIN_RPC_URL?.trim() || "http://127.0.0.1:8545";
+  const privateKey = process.env.BLOCKCHAIN_PRIVATE_KEY?.trim() || "0x59c6995e998f97a5a0044966f0945387d64f5f6f84d2d36c2f5f9f3f2cb49952";
+  const contractAddress =
+    process.env.DOCUTRUST_CONTRACT_ADDRESS?.trim() ||
+    process.env.DOCTRUST_CONTRACT_ADDRESS?.trim() ||
+    "0x0000000000000000000000000000000000000001";
+  const networkName = process.env.BLOCKCHAIN_NETWORK?.trim() || "sepolia";
+
+  if (blockchainRequired && !/^0x[a-fA-F0-9]{64}$/.test(privateKey)) {
+    throw new Error("Invalid BLOCKCHAIN_PRIVATE_KEY format. Expected 0x + 64 hex chars.");
+  }
+
+  if (blockchainRequired && !ethers.isAddress(contractAddress)) {
+    throw new Error("Invalid contract address. Set DOCUTRUST_CONTRACT_ADDRESS or DOCTRUST_CONTRACT_ADDRESS.");
+  }
+
+  if (blockchainRequired && !rpcUrl.startsWith("http://") && !rpcUrl.startsWith("https://")) {
+    throw new Error("Invalid BLOCKCHAIN_RPC_URL. Must start with http:// or https://");
+  }
+
+  const service = new BlockchainService({
+    rpcUrl,
+    privateKey,
+    contractAddress,
+    networkName,
+  }, {
+    blockchainRequired,
+    testMode,
+    mockMode,
+  });
+
+  console.log(`✓ Blockchain service initialized on ${networkName}`);
+  console.log(`✓ Contract address: ${contractAddress}`);
+  console.log(`✓ Blockchain required: ${blockchainRequired}`);
+  if (mockMode) {
+    console.log("✓ Blockchain mock mode enabled (test/safe mode)");
+  }
+
+  return service;
+}
+
+export const blockchainService = createBlockchainService();

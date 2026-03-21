@@ -1,7 +1,6 @@
-import { useLocation } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { useState } from "react";
-import { ArrowLeft, FileText, Link, CheckCircle, TrendingUp, Trash2, LogOut, Ban } from "lucide-react";
+import { useEffect, useState, useCallback } from "react";
+import { FileText, Link, CheckCircle, TrendingUp, Trash2, Ban, PlusCircle, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -9,21 +8,31 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest, queryClient } from "@/lib/queryClient";
-import CertificateForm from "@/components/certificate-form";
-import { useParams } from "wouter";
+import { useNavigate, useParams } from "react-router-dom";
 import { useAuth } from "@/hooks/use-auth";
 import type { DocumentBatchWithStats, BlockchainStatus } from "@shared/schema";
+import IssuerNavbar from "@/components/issuer-navbar";
 
 export default function IssuerDashboard() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
   const params = useParams();
-  const { user, token, logout } = useAuth();
+  const { user, token } = useAuth();
   // Use auth user ID, fallback to URL param for backward compat
   const issuerId = user?.id || params.issuerId as string;
-  const [isProcessing, setIsProcessing] = useState(false);
+  const [isDeletingDocument, setIsDeletingDocument] = useState(false);
+  const [certificates, setCertificates] = useState<any[]>([]);
+  const [locallyDeletedCertificateIds, setLocallyDeletedCertificateIds] = useState<Set<string>>(new Set());
+  const [isLoadingDashboard, setIsLoadingDashboard] = useState(false);
+  const [dashboardError, setDashboardError] = useState<string | null>(null);
+  const [stats, setStats] = useState({
+    totalDocuments: 0,
+    totalBatches: 0,
+    totalVerifications: 0,
+    successRate: 0,
+  });
 
   // Fetch issuer statistics
-  const { data: stats } = useQuery<{
+  const { data: statsFromApi, refetch: refetchStats } = useQuery<{
     totalDocuments: number;
     totalBatches: number;
     totalVerifications: number;
@@ -34,50 +43,216 @@ export default function IssuerDashboard() {
   });
 
   // Fetch document batches
-  const { data: batches, refetch: refetchBatches } = useQuery<DocumentBatchWithStats[]>({
+  const {
+    data: batches,
+    refetch: refetchBatches,
+    isLoading: isBatchesLoading,
+    isError: isBatchesError,
+  } = useQuery<DocumentBatchWithStats[]>({
     queryKey: ['/api/issuer', issuerId, 'batches'],
     enabled: !!issuerId,
   });
 
+  // Centralized dashboard data fetching function
+  const fetchDashboardData = useCallback(async () => {
+    if (!issuerId) return;
+
+    try {
+      setIsLoadingDashboard(true);
+      setDashboardError(null);
+
+      // Fetch both batches and stats in parallel
+      await Promise.all([refetchBatches(), refetchStats()]);
+    } catch (error) {
+      console.error("Failed to fetch dashboard data:", error);
+      setDashboardError("Failed to fetch dashboard data. Please try again.");
+    } finally {
+      setIsLoadingDashboard(false);
+    }
+  }, [issuerId, refetchBatches, refetchStats]);
+
+  const updateStats = (sourceCertificates: any[] = certificates) => {
+    const total = Math.max(0, sourceCertificates.length);
+    const roots = Math.max(0, sourceCertificates.length);
+    const verified = Math.max(
+      0,
+      sourceCertificates.reduce(
+        (count, certificate) => count + (certificate.verificationCount || 0),
+        0
+      )
+    );
+
+    setStats((prev) => ({
+      ...prev,
+      totalDocuments: total,
+      totalBatches: roots,
+      totalVerifications: verified,
+    }));
+  };
+
+  // Initial load: fetch dashboard data on component mount
+  useEffect(() => {
+    if (issuerId) {
+      fetchDashboardData();
+    }
+  }, [issuerId, fetchDashboardData]);
+
+  // Refresh data when user returns to dashboard tab
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && issuerId) {
+        // User came back to the tab - refresh data
+        fetchDashboardData();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [issuerId, fetchDashboardData]);
+
+  useEffect(() => {
+    const nextCertificates = (batches || [])
+      .map((batch) => ({
+        ...batch,
+        id: batch.documentId || batch.id,
+      }))
+      .filter((batch) => !locallyDeletedCertificateIds.has(batch.id));
+    setCertificates(nextCertificates);
+    updateStats(nextCertificates);
+  }, [batches, locallyDeletedCertificateIds]);
+
+  useEffect(() => {
+    if (!statsFromApi) {
+      return;
+    }
+
+    setStats(statsFromApi);
+  }, [statsFromApi]);
+
   // Fetch blockchain status
-  const { data: blockchainStatus } = useQuery<BlockchainStatus>({
+  const {
+    data: blockchainStatus,
+    isLoading: isBlockchainLoading,
+    isError: isBlockchainError,
+  } = useQuery<BlockchainStatus>({
     queryKey: ['/api/blockchain/status'],
     refetchInterval: 30000, // Refresh every 30 seconds
   });
 
-  const handleUploadSuccess = () => {
-    refetchBatches();
-    setIsProcessing(false);
-  };
-
-  const handleUploadStart = () => {
-    setIsProcessing(true);
-  };
+  const normalizedBlockchainStatus = String(
+    (blockchainStatus as any)?.status || (blockchainStatus as any)?.legacyStatus || "DISCONNECTED"
+  ).toUpperCase();
+  const blockchainStatusLabel =
+    normalizedBlockchainStatus === "CONNECTED"
+      ? "Connected"
+      : normalizedBlockchainStatus === "DISCONNECTED"
+        ? "Disconnected"
+        : normalizedBlockchainStatus === "PENDING" || normalizedBlockchainStatus === "SYNCING"
+          ? "Pending"
+          : "Error";
+  const blockchainDotClass =
+    normalizedBlockchainStatus === "CONNECTED"
+      ? "bg-green-500"
+      : normalizedBlockchainStatus === "DISCONNECTED"
+        ? "bg-red-500"
+        : normalizedBlockchainStatus === "PENDING" || normalizedBlockchainStatus === "SYNCING"
+          ? "bg-yellow-500"
+          : "bg-red-700";
 
   const { toast } = useToast();
 
-  // Delete batch mutation
-  const deleteMutation = useMutation({
-    mutationFn: async (batchId: string) => {
-      const response = await apiRequest('DELETE', `/api/issuer/${issuerId}/batch/${batchId}`);
-      return response.json();
-    },
-    onSuccess: () => {
-      toast({
-        title: "Batch Deleted",
-        description: "The document batch has been deleted successfully.",
+  const handleDelete = async (id: string) => {
+    if (!certificates.find((certificate: any) => certificate.id === id)) {
+      return;
+    }
+
+    if (isDeletingDocument) {
+      return;
+    }
+
+    const prevCertificates = certificates;
+
+    try {
+      setIsDeletingDocument(true);
+
+      // Optimistic UI update: remove from display immediately
+      setCertificates((prev: any[]) => {
+        const nextCertificates = prev.filter((c: any) => c.id !== id);
+        updateStats(nextCertificates);
+        return nextCertificates;
       });
-      refetchBatches();
-      queryClient.invalidateQueries({ queryKey: ['/api/issuer', issuerId, 'stats'] });
-    },
-    onError: (error: any) => {
+
+      setLocallyDeletedCertificateIds((prev) => {
+        const next = new Set(prev);
+        next.add(id);
+        return next;
+      });
+
+      const res = await fetch(`/api/issuer/certificate/${id}/delete`, {
+        method: "PATCH",
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      });
+
+      const data = await res.json();
+
+      // Normal delete success (200)
+      if (res.ok && data.success) {
+        toast({
+          title: "Document Deleted",
+          description: "Certificate removed successfully.",
+        });
+        // Refresh dashboard data from backend
+        await fetchDashboardData();
+        return;
+      }
+
+      // Document not found (404) - already deleted, treat as success
+      if (res.status === 404) {
+        // Item already removed from UI optimistically, just sync stats
+        toast({
+          title: "Document Removed",
+          description: "Certificate was already deleted.",
+        });
+        // Refresh dashboard data from backend
+        await fetchDashboardData();
+        return;
+      }
+
+      // Other errors - restore UI state
+      setCertificates(prevCertificates);
+      updateStats(prevCertificates);
+      setLocallyDeletedCertificateIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+
       toast({
         title: "Delete Failed",
-        description: error.message || "Failed to delete batch",
+        description: data?.message || `Error: ${res.status}`,
         variant: "destructive",
       });
-    },
-  });
+    } catch (err) {
+      console.error("Delete error:", err);
+      // Restore UI on network error
+      setCertificates(prevCertificates);
+      updateStats(prevCertificates);
+      setLocallyDeletedCertificateIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      toast({
+        title: "Delete Failed",
+        description: err instanceof Error ? err.message : "Network error",
+        variant: "destructive",
+      });
+    } finally {
+      setIsDeletingDocument(false);
+    }
+  };
 
   // Revoke batch mutation
   const revokeMutation = useMutation({
@@ -85,13 +260,13 @@ export default function IssuerDashboard() {
       const response = await apiRequest('POST', `/api/issuer/revoke`, { batchId });
       return response.json();
     },
-    onSuccess: (data) => {
+    onSuccess: async (data) => {
       toast({
         title: "Document Revoked",
         description: `Document has been revoked on blockchain. TX: ${data.blockchain?.txHash?.slice(0, 16)}...`,
       });
-      refetchBatches();
-      queryClient.invalidateQueries({ queryKey: ['/api/issuer', issuerId, 'stats'] });
+      // Refresh dashboard data from backend
+      await fetchDashboardData();
     },
     onError: (error: any) => {
       toast({
@@ -104,45 +279,57 @@ export default function IssuerDashboard() {
 
   return (
     <div className="min-h-screen bg-background">
-      {/* Header */}
-      <header className="bg-card border-b border-border sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex justify-between items-center h-16">
-            <div className="flex items-center space-x-4">
-              <div className="flex items-center space-x-2">
-                <div className="w-8 h-8 bg-primary rounded-full flex items-center justify-center">
-                  <FileText className="h-4 w-4 text-primary-foreground" />
-                </div>
-                <span className="font-bold text-xl text-foreground">DocuTrust</span>
-              </div>
-              <div className="text-muted-foreground text-sm hidden md:block">
-                Dashboard {'>'} Issuer
-              </div>
-            </div>
-            <div className="flex items-center space-x-4">
-              {user && (
-                <div className="text-sm text-muted-foreground">
-                  {user.name} ({user.email})
-                </div>
-              )}
-              <Button
-                variant="outline"
-                onClick={() => { logout(); setLocation('/'); }}
-              >
-                <LogOut className="h-4 w-4 mr-2" />
-                Sign Out
-              </Button>
-            </div>
-          </div>
-        </div>
-      </header>
+      <IssuerNavbar />
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {/* Dashboard Header */}
-        <div className="mb-8">
-          <h1 className="text-3xl font-bold text-foreground mb-2">Issuer Dashboard</h1>
-          <p className="text-muted-foreground">Upload and manage document batches with blockchain verification</p>
+        <div className="mb-8 flex items-center justify-between gap-4">
+          <div>
+            <h1 className="text-3xl font-bold text-foreground mb-2">Issuer Dashboard</h1>
+            <p className="text-muted-foreground">Manage issued certificates and blockchain verification status.</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button 
+              onClick={() => fetchDashboardData()} 
+              variant="outline"
+              size="sm"
+              disabled={isLoadingDashboard}
+              className="gap-2"
+              data-testid="button-refresh-dashboard"
+            >
+              <RefreshCw className={`h-4 w-4 ${isLoadingDashboard ? 'animate-spin' : ''}`} />
+              {isLoadingDashboard ? 'Refreshing...' : 'Refresh'}
+            </Button>
+            <Button onClick={() => navigate("/certificate/create")} className="gap-2" data-testid="button-start-certificate-flow">
+              <PlusCircle className="h-4 w-4" />
+              Create Certificate
+            </Button>
+          </div>
         </div>
+
+        {(isBatchesError || isBlockchainError || dashboardError) && (
+          <div className="mb-6 rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700" data-testid="issuer-dashboard-error">
+            <div className="flex items-center justify-between gap-3">
+              <span>
+                {dashboardError
+                  ? dashboardError
+                  : isBatchesError
+                    ? "Unable to load issued certificates."
+                    : "Unable to load blockchain status."}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => fetchDashboardData()}
+                disabled={isLoadingDashboard}
+                className="gap-2"
+              >
+                <RefreshCw className={`h-4 w-4 ${isLoadingDashboard ? 'animate-spin' : ''}`} />
+                {isLoadingDashboard ? 'Refreshing...' : 'Retry'}
+              </Button>
+            </div>
+          </div>
+        )}
 
         {/* Stats Overview */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
@@ -152,7 +339,7 @@ export default function IssuerDashboard() {
                 <div>
                   <p className="text-muted-foreground text-sm">Total Documents</p>
                   <p className="text-2xl font-bold text-foreground" data-testid="text-total-documents">
-                    {stats?.totalDocuments || 0}
+                    {stats.totalDocuments || 0}
                   </p>
                 </div>
                 <div className="w-10 h-10 bg-primary/10 rounded-lg flex items-center justify-center">
@@ -168,7 +355,7 @@ export default function IssuerDashboard() {
                 <div>
                   <p className="text-muted-foreground text-sm">Blockchain Roots</p>
                   <p className="text-2xl font-bold text-foreground" data-testid="text-blockchain-roots">
-                    {stats?.totalBatches || 0}
+                    {stats.totalBatches || 0}
                   </p>
                 </div>
                 <div className="w-10 h-10 bg-green-500/10 rounded-lg flex items-center justify-center">
@@ -184,7 +371,7 @@ export default function IssuerDashboard() {
                 <div>
                   <p className="text-muted-foreground text-sm">Verifications</p>
                   <p className="text-2xl font-bold text-foreground" data-testid="text-verifications">
-                    {stats?.totalVerifications || 0}
+                    {stats.totalVerifications || 0}
                   </p>
                 </div>
                 <div className="w-10 h-10 bg-blue-500/10 rounded-lg flex items-center justify-center">
@@ -200,7 +387,7 @@ export default function IssuerDashboard() {
                 <div>
                   <p className="text-muted-foreground text-sm">Success Rate</p>
                   <p className="text-2xl font-bold text-foreground" data-testid="text-success-rate">
-                    {stats?.successRate ? `${stats.successRate.toFixed(1)}%` : '0%'}
+                    {stats.successRate ? `${stats.successRate.toFixed(1)}%` : '0%'}
                   </p>
                 </div>
                 <div className="w-10 h-10 bg-amber-500/10 rounded-lg flex items-center justify-center">
@@ -212,16 +399,7 @@ export default function IssuerDashboard() {
         </div>
 
         <div className="grid lg:grid-cols-3 gap-8">
-          {/* Certificate Creation Section */}
-          <div className="lg:col-span-2">
-            <CertificateForm
-              issuerId={issuerId}
-              onCertificateCreated={handleUploadSuccess}
-            />
-          </div>
-
-          {/* Blockchain Status */}
-          <div className="lg:col-span-1">
+          <div className="lg:col-span-1 lg:col-start-3">
             <Card className="mb-6">
               <CardHeader>
                 <CardTitle className="text-lg">Blockchain Status</CardTitle>
@@ -237,21 +415,21 @@ export default function IssuerDashboard() {
                   <div className="flex items-center justify-between">
                     <span className="text-sm text-muted-foreground">Block Height</span>
                     <span className="text-sm font-mono text-foreground" data-testid="text-block-height">
-                      #{blockchainStatus?.blockHeight || '0'}
+                      {isBlockchainLoading ? 'Loading...' : `#${blockchainStatus?.blockHeight || '0'}`}
                     </span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span className="text-sm text-muted-foreground">Gas Price</span>
                     <span className="text-sm text-foreground" data-testid="text-gas-price">
-                      {blockchainStatus?.gasPrice || '0'} gwei
+                      {isBlockchainLoading ? 'Loading...' : `${blockchainStatus?.gasPrice || '0'} gwei`}
                     </span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span className="text-sm text-muted-foreground">Status</span>
                     <div className="flex items-center space-x-2">
-                      <div className={`w-2 h-2 rounded-full ${blockchainStatus?.status === 'connected' ? 'bg-green-500' : 'bg-red-500'}`}></div>
+                      <div className={`w-2 h-2 rounded-full ${blockchainDotClass}`}></div>
                       <span className="text-sm text-foreground" data-testid="text-blockchain-status">
-                        {blockchainStatus?.status === 'connected' ? 'Connected' : 'Disconnected'}
+                        {isBlockchainLoading ? 'Loading...' : blockchainStatusLabel}
                       </span>
                     </div>
                   </div>
@@ -282,7 +460,14 @@ export default function IssuerDashboard() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {batches?.map((batch) => (
+                    {isBatchesLoading && (
+                      <TableRow>
+                        <TableCell colSpan={6} className="text-center text-muted-foreground py-8">
+                          Loading issued certificates...
+                        </TableCell>
+                      </TableRow>
+                    )}
+                    {certificates.map((batch) => (
                       <TableRow key={batch.id} data-testid={`row-batch-${batch.id}`}>
                         <TableCell>
                           <div className="text-sm font-medium text-foreground">{batch.batchName}</div>
@@ -301,20 +486,16 @@ export default function IssuerDashboard() {
                         </TableCell>
                         <TableCell>
                           <Badge
-                            variant={batch.status === 'completed' ? 'default' : 'secondary'}
+                            variant="secondary"
                             className={
-                              batch.status === 'revoked' ? 'bg-red-100 text-red-800' :
-                              batch.status === 'completed' ? 'bg-green-100 text-green-800' :
-                                batch.status === 'blockchain_stored' ? 'bg-blue-100 text-blue-800' :
-                                  batch.status === 'signed' ? 'bg-purple-100 text-purple-800' :
-                                    'bg-yellow-100 text-yellow-800'
+                              batch.blockchainStatus === 'CONFIRMED'
+                                ? 'bg-green-100 text-green-800'
+                                : batch.blockchainStatus === 'FAILED'
+                                  ? 'bg-red-100 text-red-800'
+                                  : 'bg-yellow-100 text-yellow-800'
                             }
                           >
-                            {batch.status === 'revoked' ? '⛔ Revoked' :
-                              batch.status === 'completed' ? 'Confirmed' :
-                              batch.status === 'blockchain_stored' ? 'Stored' :
-                                batch.status === 'signed' ? 'Signed' :
-                                  'Processing'}
+                            {batch.blockchainStatus || 'PENDING'}
                           </Badge>
                         </TableCell>
                         <TableCell className="text-sm text-foreground">
@@ -330,7 +511,7 @@ export default function IssuerDashboard() {
                                     variant="ghost"
                                     size="sm"
                                     className="text-orange-600 hover:text-orange-700 hover:bg-orange-50"
-                                    disabled={revokeMutation.isPending}
+                                    disabled={revokeMutation.isPending || isDeletingDocument}
                                   >
                                     <Ban className="h-4 w-4 mr-1" />
                                     Revoke
@@ -362,8 +543,8 @@ export default function IssuerDashboard() {
                               <span className="text-xs text-red-600 font-medium">Revoked</span>
                             )}
 
-                            <Button variant="link" size="sm">
-                              View
+                            <Button variant="link" size="sm" disabled className="opacity-50 cursor-not-allowed">
+                              Details Soon
                             </Button>
                             <AlertDialog>
                               <AlertDialogTrigger asChild>
@@ -371,6 +552,7 @@ export default function IssuerDashboard() {
                                   variant="ghost"
                                   size="sm"
                                   className="text-destructive hover:text-destructive hover:bg-destructive/10"
+                                  disabled={isDeletingDocument}
                                 >
                                   <Trash2 className="h-4 w-4" />
                                 </Button>
@@ -379,13 +561,13 @@ export default function IssuerDashboard() {
                                 <AlertDialogHeader>
                                   <AlertDialogTitle>Delete Certificate?</AlertDialogTitle>
                                   <AlertDialogDescription>
-                                    This will permanently delete "{batch.batchName}". This action cannot be undone. Note: Blockchain records are permanent and will not be affected.
+                                    This will mark "{batch.batchName}" as deleted in the system. Blockchain records are immutable and will remain for audit/verification history.
                                   </AlertDialogDescription>
                                 </AlertDialogHeader>
                                 <AlertDialogFooter>
                                   <AlertDialogCancel>Cancel</AlertDialogCancel>
                                   <AlertDialogAction
-                                    onClick={() => deleteMutation.mutate(batch.id)}
+                                    onClick={() => handleDelete(batch.id)}
                                     className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
                                   >
                                     Delete
@@ -397,7 +579,7 @@ export default function IssuerDashboard() {
                         </TableCell>
                       </TableRow>
                     ))}
-                    {(!batches || batches.length === 0) && (
+                    {!isBatchesLoading && certificates.length === 0 && (
                       <TableRow>
                         <TableCell colSpan={6} className="text-center text-muted-foreground py-8">
                           No certificates issued yet. Create your first certificate above to get started.

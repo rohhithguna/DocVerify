@@ -11,7 +11,7 @@ import * as blockchainController from "../controllers/blockchain.controller";
 
 // Middleware
 import { errorHandler, notFoundHandler } from "../middleware/error-handler";
-import { requireAuth, optionalAuth } from "../middleware/auth";
+import { requireAuth } from "../middleware/auth";
 import {
   generalLimiter,
   uploadLimiter,
@@ -23,10 +23,16 @@ import {
   validateParams,
   issuerIdParamSchema,
   batchIdParamSchema,
+  documentIdParamSchema,
   uploadBodySchema,
   createCertificateBodySchema,
+  createCertificateBatchBodySchema,
+  revokeBodySchema,
+  validateCreateCertificateUniqueness,
+  certificateIdParamSchema,
   verifierIdParamSchema,
   verifyBodySchema,
+  verifyMetadataBodySchema,
 } from "../middleware/validation";
 
 const upload = multer({
@@ -70,6 +76,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Get issuer batches
   app.get(
     "/api/issuer/:issuerId/batches",
+    requireAuth,
     validateParams(issuerIdParamSchema),
     issuerController.getBatches
   );
@@ -82,6 +89,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
     issuerController.deleteBatch
   );
 
+  // Soft-delete a single certificate document
+  app.patch(
+    "/api/issuer/certificate/:id/delete",
+    requireAuth,
+    validateParams(documentIdParamSchema),
+    issuerController.deleteDocument
+  );
+
   // Create certificate (form-based)
   app.post(
     "/api/issuer/:issuerId/create-certificate",
@@ -89,12 +104,24 @@ export async function registerRoutes(app: Express): Promise<Server> {
     uploadLimiter,
     validateParams(issuerIdParamSchema),
     validateBody(createCertificateBodySchema),
+    validateCreateCertificateUniqueness,
     issuerController.createCertificate
+  );
+
+  // Create certificate batch Merkle root + proofs
+  app.post(
+    "/api/issuer/:issuerId/create-certificate-batch",
+    requireAuth,
+    uploadLimiter,
+    validateParams(issuerIdParamSchema),
+    validateBody(createCertificateBatchBodySchema),
+    issuerController.createCertificateBatch
   );
 
   // Get issuer statistics
   app.get(
     "/api/issuer/:issuerId/stats",
+    requireAuth,
     validateParams(issuerIdParamSchema),
     issuerController.getStats
   );
@@ -103,6 +130,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.post(
     "/api/issuer/revoke",
     requireAuth,
+    validateBody(revokeBodySchema),
     revokeController.revokeDocument
   );
 
@@ -117,6 +145,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
     upload.single('file'),
     validateBody(verifyBodySchema),
     verifierController.verifyDocument
+  );
+
+  // Verify certificate by structured metadata (canonical flow)
+  app.post(
+    "/api/verifier/verify-metadata",
+    verifyLimiter,
+    validateBody(verifyMetadataBodySchema),
+    verifierController.verifyMetadata
+  );
+
+  // Lookup certificate metadata by certificate ID
+  app.get(
+    "/api/certificate/:certificateId",
+    validateParams(certificateIdParamSchema),
+    verifierController.getCertificateById
   );
 
   // Get verifier history

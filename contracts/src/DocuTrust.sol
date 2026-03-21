@@ -3,8 +3,8 @@ pragma solidity ^0.8.20;
 
 /**
  * @title DocuTrust
- * @notice Blockchain-based document verification contract.
- *         Stores SHA-256 document hashes on-chain for tamper-proof verification.
+ * @notice Blockchain-based certificate verification contract.
+ *         Stores Merkle roots on-chain for tamper-proof verification.
  * @dev    Designed for simplicity. No upgradability, no proxies, no oracles.
  */
 contract DocuTrust {
@@ -12,24 +12,22 @@ contract DocuTrust {
     //  Data Structures
     // ──────────────────────────────────────────────
 
-    struct Document {
-        address issuer;       // wallet that issued the document
-        uint256 timestamp;    // block timestamp when issued
-        bool    exists;       // true if hash has been registered
-        bool    revoked;      // true if document has been revoked
-    }
-
-    // ──────────────────────────────────────────────
-    //  State
-    // ──────────────────────────────────────────────
-
     /// @notice Contract owner (deployer)
     address public owner;
 
-    /// @notice Mapping from document hash → Document metadata
-    mapping(bytes32 => Document) public documents;
+    /// @notice Mapping from Merkle root -> validity
+    mapping(bytes32 => bool) public validRoots;
 
-    /// @notice Total number of documents ever issued
+    /// @notice Mapping from Merkle root -> revocation state
+    mapping(bytes32 => bool) public revokedRoots;
+
+    /// @notice Mapping from Merkle root -> issuer address
+    mapping(bytes32 => address) public rootIssuers;
+
+    /// @notice Mapping from Merkle root -> created timestamp
+    mapping(bytes32 => uint256) public rootTimestamps;
+
+    /// @notice Total number of roots ever issued
     uint256 public totalDocuments;
 
     /// @notice Tracks authorized issuers (owner can add/remove)
@@ -39,6 +37,8 @@ contract DocuTrust {
     //  Events
     // ──────────────────────────────────────────────
 
+    event RootStored(bytes32 indexed root, address indexed issuer, uint256 timestamp);
+    event RootRevoked(bytes32 indexed root, address indexed revokedBy, uint256 timestamp);
     event DocumentIssued(bytes32 indexed docHash, address indexed issuer, uint256 timestamp);
     event DocumentRevoked(bytes32 indexed docHash, address indexed revokedBy, uint256 timestamp);
     event IssuerAdded(address indexed issuer);
@@ -74,35 +74,33 @@ contract DocuTrust {
     //  Core Functions
     // ──────────────────────────────────────────────
 
-    /**
-     * @notice Register a document hash on the blockchain.
-     * @param  docHash  The SHA-256 hash of the document (as bytes32).
-     */
-    function issueDocument(bytes32 docHash) external onlyAuthorized {
-        require(docHash != bytes32(0), "DocuTrust: empty hash");
-        require(!documents[docHash].exists, "DocuTrust: document already issued");
+    function _storeRoot(bytes32 root, address issuer) private {
+        require(root != bytes32(0), "DocuTrust: empty hash");
+        require(!validRoots[root], "DocuTrust: document already issued");
 
-        documents[docHash] = Document({
-            issuer:    msg.sender,
-            timestamp: block.timestamp,
-            exists:    true,
-            revoked:   false
-        });
+        validRoots[root] = true;
+        revokedRoots[root] = false;
+        rootIssuers[root] = issuer;
+        rootTimestamps[root] = block.timestamp;
 
         totalDocuments++;
 
-        emit DocumentIssued(docHash, msg.sender, block.timestamp);
+        emit RootStored(root, issuer, block.timestamp);
+        emit DocumentIssued(root, issuer, block.timestamp);
     }
 
     /**
-     * @notice Check if a document hash exists and is valid (not revoked).
-     * @param  docHash  The SHA-256 hash to verify.
-     * @return exists_   True if the hash was ever registered.
-     * @return revoked_  True if the document was revoked.
-     * @return issuer_   The address that originally issued it.
-     * @return timestamp_ The block timestamp when it was issued.
+     * @notice Register a Merkle root on the blockchain.
+     * @param root The Merkle root as bytes32.
      */
-    function verifyDocument(bytes32 docHash)
+    function storeRoot(bytes32 root) public onlyAuthorized {
+        _storeRoot(root, msg.sender);
+    }
+
+    /**
+     * @notice Check if a Merkle root exists and whether it was revoked.
+     */
+    function verifyRoot(bytes32 root)
         external
         view
         returns (
@@ -112,27 +110,57 @@ contract DocuTrust {
             uint256 timestamp_
         )
     {
-        Document storage doc = documents[docHash];
-        return (doc.exists, doc.revoked, doc.issuer, doc.timestamp);
+        return (
+            validRoots[root],
+            revokedRoots[root],
+            rootIssuers[root],
+            rootTimestamps[root]
+        );
     }
 
     /**
-     * @notice Revoke a previously issued document.
+     * @notice Revoke a previously stored Merkle root.
      *         Only the original issuer or the contract owner can revoke.
-     * @param  docHash  The SHA-256 hash of the document to revoke.
      */
-    function revokeDocument(bytes32 docHash) external {
-        Document storage doc = documents[docHash];
-        require(doc.exists, "DocuTrust: document does not exist");
-        require(!doc.revoked, "DocuTrust: document already revoked");
+    function revokeRoot(bytes32 root) public {
+        require(validRoots[root], "DocuTrust: document does not exist");
+        require(!revokedRoots[root], "DocuTrust: document already revoked");
         require(
-            msg.sender == doc.issuer || msg.sender == owner,
+            msg.sender == rootIssuers[root] || msg.sender == owner,
             "DocuTrust: only issuer or owner can revoke"
         );
 
-        doc.revoked = true;
+        revokedRoots[root] = true;
 
-        emit DocumentRevoked(docHash, msg.sender, block.timestamp);
+        emit RootRevoked(root, msg.sender, block.timestamp);
+        emit DocumentRevoked(root, msg.sender, block.timestamp);
+    }
+
+    // Backward-compatible wrappers. These now operate on roots.
+    function issueDocument(bytes32 docHash) external onlyAuthorized {
+        _storeRoot(docHash, msg.sender);
+    }
+
+    function verifyDocument(bytes32 docHash)
+        external
+        view
+        returns (
+            bool exists_,
+            bool revoked_,
+            address issuer_,
+            uint256 timestamp_
+        )
+    {
+        return (
+            validRoots[docHash],
+            revokedRoots[docHash],
+            rootIssuers[docHash],
+            rootTimestamps[docHash]
+        );
+    }
+
+    function revokeDocument(bytes32 docHash) external {
+        revokeRoot(docHash);
     }
 
     // ──────────────────────────────────────────────

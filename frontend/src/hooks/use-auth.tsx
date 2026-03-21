@@ -24,6 +24,19 @@ interface RegisterData {
   organization?: string;
 }
 
+async function getApiErrorMessage(response: Response, fallbackMessage: string): Promise<string> {
+  try {
+    const payload = await response.json();
+    if (typeof payload?.error === "string" && payload.error.trim()) {
+      return payload.error;
+    }
+  } catch {
+    // Ignore JSON parse errors and use fallback message.
+  }
+
+  return fallbackMessage;
+}
+
 const AuthContext = createContext<AuthContextType | null>(null);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -58,36 +71,40 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const res = await fetch("/api/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
     });
 
     if (!res.ok) {
-      const data = await res.json();
-      throw new Error(data.error || "Login failed");
+      const message = await getApiErrorMessage(res, "Login failed");
+      throw new Error(message);
     }
 
     const data = await res.json();
+    
+    // Step 1: Immediately save token to localStorage
+    localStorage.setItem("docutrust_token", data.token);
+    
+    // Step 2: Update state (synchronous but batched by React)
     setToken(data.token);
     setUser(data.user);
-    localStorage.setItem("docutrust_token", data.token);
+    
+    // Step 3: Small delay to ensure state updates are flushed to DOM
+    await new Promise(resolve => setTimeout(resolve, 100));
   };
 
   const register = async ({ email, password, name, organization }: RegisterData) => {
     const res = await fetch("/api/auth/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password, name, organization }),
+      body: JSON.stringify({ email: email.trim().toLowerCase(), password, name: name.trim(), organization }),
     });
 
     if (!res.ok) {
-      const data = await res.json();
-      throw new Error(data.error || "Registration failed");
+      const message = await getApiErrorMessage(res, "Registration failed");
+      throw new Error(message);
     }
 
-    const data = await res.json();
-    setToken(data.token);
-    setUser(data.user);
-    localStorage.setItem("docutrust_token", data.token);
+    await res.json();
   };
 
   const logout = () => {
