@@ -645,7 +645,18 @@ export class DbStorage implements IStorage {
       .from(documents)
       .where(inArray(documents.id, activeDocumentIds));
 
-    const totalBatches = new Set(activeDocuments.map((document) => document.batchId)).size;
+    // Get unique batch IDs, then filter out revoked batches
+    const uniqueBatchIds = Array.from(new Set(activeDocuments.map((document) => document.batchId)));
+    const activeBatches = uniqueBatchIds.length > 0
+      ? await this.db
+          .select({ id: documentBatches.id })
+          .from(documentBatches)
+          .where(and(
+            inArray(documentBatches.id, uniqueBatchIds),
+            eq(documentBatches.revoked, false)
+          ))
+      : [];
+    const totalBatches = activeBatches.length;
 
     const scopedVerifications = await this.db
       .select()

@@ -135,6 +135,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
     revokeController.revokeDocument
   );
 
+  // Unrevoke a document batch
+  app.post(
+    "/api/issuer/unrevoke",
+    requireAuth,
+    validateBody(revokeBodySchema), // same schema (just needs batchId)
+    revokeController.unrevokeDocument
+  );
+
   // ============================================
   // Verifier Routes
   // ============================================

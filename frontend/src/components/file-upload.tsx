@@ -1,11 +1,8 @@
 import { useState, useRef, useCallback } from "react";
-import * as pdfjsLib from "pdfjs-dist";
-
-// Configure PDF.js worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
 import { useMutation } from "@tanstack/react-query";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequestMultipart, queryClient } from "@/lib/queryClient";
+import { convertPdfToImageFile } from "@/lib/pdf-utils";
 
 /* Issuer-mode UI components — only imported when needed */
 import { Label } from "@/components/ui/label";
@@ -172,30 +169,6 @@ export default function FileUpload({
     if (inputRef.current) inputRef.current.value = '';
   }, [onFilePreview]);
 
-  const convertPdfToPng = useCallback(async (pdfFile: File): Promise<File> => {
-    const arrayBuffer = await pdfFile.arrayBuffer();
-    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-    const page = await pdf.getPage(1);
-
-    // Render at 2x scale for better QR code readability
-    const scale = 2;
-    const viewport = page.getViewport({ scale });
-    const canvas = document.createElement('canvas');
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
-    const ctx = canvas.getContext('2d')!;
-
-    await page.render({ canvasContext: ctx, viewport }).promise;
-
-    const blob = await new Promise<Blob>((resolve) =>
-      canvas.toBlob((b) => resolve(b!), 'image/png')
-    );
-
-    // Create a new File object with a .png extension so the backend recognises it
-    const pngName = pdfFile.name.replace(/\.pdf$/i, '.png');
-    return new File([blob], pngName, { type: 'image/png' });
-  }, []);
-
   const processFile = useCallback(async (selectedFile: File) => {
     const maxSize = isIssuerMode ? 50 * 1024 * 1024 : 10 * 1024 * 1024;
     if (selectedFile.size > maxSize) {
@@ -221,43 +194,43 @@ export default function FileUpload({
     setInlineStatusType("info");
     setInlineStatusMessage(isVerifierMode ? "Scanning document…" : "File selected.");
 
+    // Generate preview for images/PDFs
     // Notify parent of selected file name
     onFileSelected?.(selectedFile.name);
-
-    // Generate preview for images
-    if (isVerifierMode && selectedFile.type.startsWith('image/')) {
-      const url = URL.createObjectURL(selectedFile);
-      onFilePreview?.(url);
-    } else {
-      onFilePreview?.(null);
-    }
 
     if (isVerifierMode) {
       onUploadStart?.();
 
-      // If the file is a PDF, convert its first page to a PNG image first
-      const isPdf = selectedFile.type === 'application/pdf' || selectedFile.name.toLowerCase().endsWith('.pdf');
-      if (isPdf) {
+      let fileToVerify = selectedFile;
+      if (selectedFile.type === 'application/pdf' || selectedFile.name.toLowerCase().endsWith('.pdf')) {
         try {
-          setInlineStatusMessage("Converting PDF to image for QR scan…");
-          const pngFile = await convertPdfToPng(selectedFile);
-
-          // Show the converted image as preview
-          const previewUrl = URL.createObjectURL(pngFile);
-          onFilePreview?.(previewUrl);
-
-          verifyByQrMutation.mutate(pngFile);
-        } catch (err) {
-          const message = err instanceof Error ? err.message : "Failed to read PDF";
+          fileToVerify = await convertPdfToImageFile(selectedFile);
+        } catch (error) {
+          toast({
+            title: "PDF Error",
+            description: "Failed to render PDF for scanning",
+            variant: "destructive",
+          });
           setInlineStatusType("error");
-          setInlineStatusMessage(`PDF processing failed: ${message}`);
-          onVerificationError?.(message);
+          setInlineStatusMessage("Failed to render PDF.");
+          onFilePreview?.(null);
+          return;
         }
-      } else {
-        verifyByQrMutation.mutate(selectedFile);
       }
+
+      if (fileToVerify.type.startsWith('image/')) {
+        const url = URL.createObjectURL(fileToVerify);
+        onFilePreview?.(url);
+      } else {
+        onFilePreview?.(null);
+      }
+      
+      setFile(fileToVerify);
+      verifyByQrMutation.mutate(fileToVerify);
+    } else {
+      onFilePreview?.(null);
     }
-  }, [isIssuerMode, isVerifierMode, toast, onFilePreview, onFileSelected, onUploadStart, verifyByQrMutation, convertPdfToPng, onVerificationError]);
+  }, [isIssuerMode, isVerifierMode, toast, onFilePreview, onFileSelected, onUploadStart, verifyByQrMutation]);
 
   const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];

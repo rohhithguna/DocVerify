@@ -42,6 +42,15 @@ export const DOCUTRUST_ABI = [
     type: "function",
   },
 
+  // unrevokeRoot(bytes32 root)
+  {
+    inputs: [{ name: "root", type: "bytes32" }],
+    name: "unrevokeRoot",
+    outputs: [],
+    stateMutability: "nonpayable",
+    type: "function",
+  },
+
   // Backward-compatible wrappers (operate on roots)
 
   // issueDocument(bytes32 docHash)
@@ -71,6 +80,15 @@ export const DOCUTRUST_ABI = [
   {
     inputs: [{ name: "docHash", type: "bytes32" }],
     name: "revokeDocument",
+    outputs: [],
+    stateMutability: "nonpayable",
+    type: "function",
+  },
+
+  // unrevokeDocument(bytes32 docHash)
+  {
+    inputs: [{ name: "docHash", type: "bytes32" }],
+    name: "unrevokeDocument",
     outputs: [],
     stateMutability: "nonpayable",
     type: "function",

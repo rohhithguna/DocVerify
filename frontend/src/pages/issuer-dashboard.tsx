@@ -89,7 +89,7 @@ export default function IssuerDashboard() {
 
   const updateStats = (sourceCertificates: any[] = certificates) => {
     const total = Math.max(0, sourceCertificates.length);
-    const roots = Math.max(0, sourceCertificates.length);
+    const roots = Math.max(0, sourceCertificates.filter((c) => c.status !== 'revoked').length);
     const verified = Math.max(0, sourceCertificates.reduce((count, certificate) => count + (certificate.verificationCount || 0), 0));
     setStats((prev) => ({
       ...prev,
@@ -113,7 +113,7 @@ export default function IssuerDashboard() {
 
   useEffect(() => {
     const nextCertificates = (batchesResponse?.batches || [])
-      .map((batch) => ({ ...batch, id: batch.documentId || batch.id }))
+      .map((batch) => ({ ...batch, batchId: batch.id, id: batch.documentId || batch.id }))
       .filter((batch) => !locallyDeletedCertificateIds.has(batch.id));
     setCertificates(nextCertificates);
     updateStats(nextCertificates);
@@ -174,6 +174,20 @@ export default function IssuerDashboard() {
     },
     onError: (error: any) => {
       toast({ title: "Revocation Failed", description: error.message || "Failed to revoke document", variant: "destructive" });
+    },
+  });
+
+  const unrevokeMutation = useMutation({
+    mutationFn: async (batchId: string) => {
+      const response = await apiRequest('POST', `/api/issuer/unrevoke`, { batchId });
+      return response.json();
+    },
+    onSuccess: async (data) => {
+      toast({ title: "Document Reconnected", description: `Document has been restored on blockchain. TX: ${data.blockchain?.txHash?.slice(0, 16)}...` });
+      await fetchDashboardData();
+    },
+    onError: (error: any) => {
+      toast({ title: "Reconnect Failed", description: error.message || "Failed to reconnect document", variant: "destructive" });
     },
   });
 
@@ -348,24 +362,24 @@ export default function IssuerDashboard() {
                       </td>
                       <td className="px-4 py-3 text-right">
                         <div className="flex items-center justify-end gap-1">
-                          {batch.status !== 'revoked' && batch.merkleRoot && (
+                          {batch.status === 'revoked' && batch.merkleRoot && (
                             <AlertDialog>
                               <AlertDialogTrigger asChild>
-                              <Button variant="ghost" size="icon" disabled={revokeMutation.isPending || isDeletingDocument} className="h-8 w-8 text-[#dc2626] hover:text-[#b91c1c] hover:bg-[#fef2f2] rounded-[6px] transition-all duration-200" title="Revoke">
-                                  <ShieldOff className="w-4 h-4" />
+                              <Button variant="ghost" size="icon" disabled={unrevokeMutation.isPending || isDeletingDocument} className="h-8 w-8 text-[#16a34a] hover:text-[#15803d] hover:bg-[#f0fdf4] rounded-[6px] transition-all duration-200" title="Reconnect">
+                                  <LinkIcon className="w-4 h-4" />
                                 </Button>
                               </AlertDialogTrigger>
                               <AlertDialogContent className="rounded-[12px] p-6 sm:max-w-md border border-[#e5e7eb] shadow-xl">
                                 <AlertDialogHeader>
-                                  <AlertDialogTitle className="text-xl font-bold text-[#111827]">Revoke Document</AlertDialogTitle>
+                                  <AlertDialogTitle className="text-xl font-bold text-[#111827]">Reconnect Document (Revoke)</AlertDialogTitle>
                                   <AlertDialogDescription className="text-[#6b7280] mt-2">
-                                    This will revoke "{batch.batchName}" permanently on the blockchain. Verification will fail immediately worldwide.
+                                    This will unrevoke "{batch.batchName}" permanently on the blockchain. Verifications will succeed again.
                                   </AlertDialogDescription>
                                 </AlertDialogHeader>
                                 <AlertDialogFooter className="mt-6">
                                   <AlertDialogCancel className="rounded-[8px] h-10 px-4 font-semibold border-[#e5e7eb] text-[#111827] hover:bg-[#f3f4f6]">Cancel</AlertDialogCancel>
-                                  <AlertDialogAction onClick={() => revokeMutation.mutate(batch.id)} className="rounded-[8px] h-10 px-4 bg-[#dc2626] hover:bg-[#b91c1c] text-white font-semibold flex items-center gap-2 transition-all duration-200 hover:shadow-md hover:-translate-y-0.5">
-                                    Confirm Revocation
+                                  <AlertDialogAction onClick={() => unrevokeMutation.mutate(batch.batchId)} className="rounded-[8px] h-10 px-4 bg-[#16a34a] hover:bg-[#15803d] text-white font-semibold flex items-center gap-2 transition-all duration-200 hover:shadow-md hover:-translate-y-0.5">
+                                    Confirm Reconnect
                                   </AlertDialogAction>
                                 </AlertDialogFooter>
                               </AlertDialogContent>
@@ -382,14 +396,29 @@ export default function IssuerDashboard() {
                               <AlertDialogHeader>
                                 <AlertDialogTitle className="text-xl font-bold text-[#111827]">Delete Record</AlertDialogTitle>
                                 <AlertDialogDescription className="text-[#6b7280] mt-2">
-                                  Remove "{batch.batchName}" from this dashboard. Blockchain elements are immutable and will remain.
+                                  How would you like to delete "{batch.batchName}"?
                                 </AlertDialogDescription>
                               </AlertDialogHeader>
-                              <AlertDialogFooter className="mt-6">
+                              <div className="flex flex-col gap-3 mt-4">
+                                <div className="text-sm text-[#4b5563]">
+                                  <strong>Permanent Delete</strong>: Removes it entirely from your dashboard.
+                                </div>
+                                <div className="text-sm text-[#4b5563]">
+                                  <strong>Delete (Soft Delete)</strong>: It stays on the dashboard but is deleted (revoked) from the blockchain.
+                                </div>
+                              </div>
+                              <AlertDialogFooter className="mt-6 sm:justify-between items-center w-full flex-row">
                                 <AlertDialogCancel className="rounded-[8px] h-10 px-4 font-semibold border-[#e5e7eb] text-[#111827] hover:bg-[#f3f4f6]">Cancel</AlertDialogCancel>
-                                <AlertDialogAction onClick={() => handleDelete(batch.id)} className="rounded-[8px] h-10 px-4 bg-[#111827] hover:bg-[#000000] text-white font-semibold flex items-center gap-2 transition-all duration-200 hover:shadow-md hover:-translate-y-0.5">
-                                  Delete
-                                </AlertDialogAction>
+                                <div className="flex gap-2">
+                                  {batch.status !== 'revoked' && (
+                                    <AlertDialogAction onClick={() => revokeMutation.mutate(batch.batchId)} className="rounded-[8px] h-10 px-4 bg-[#f59e0b] hover:bg-[#d97706] text-white font-semibold flex items-center gap-2 transition-all duration-200 hover:shadow-md hover:-translate-y-0.5 border-none">
+                                      Delete
+                                    </AlertDialogAction>
+                                  )}
+                                  <AlertDialogAction onClick={() => handleDelete(batch.id)} className="rounded-[8px] h-10 px-4 bg-[#dc2626] hover:bg-[#b91c1c] text-white font-semibold flex items-center gap-2 transition-all duration-200 hover:shadow-md hover:-translate-y-0.5 border-none">
+                                    Permanent Delete
+                                  </AlertDialogAction>
+                                </div>
                               </AlertDialogFooter>
                             </AlertDialogContent>
                           </AlertDialog>

@@ -218,6 +218,22 @@ export class BlockchainService {
     }
   }
 
+  public async unrevokeMerkleRoot(merkleRoot: string): Promise<BlockchainTransaction> {
+    if (this.testMode || this.mockMode) {
+      return this.mockTransaction("confirmed");
+    }
+
+    try {
+      const rootBytes32 = this.toBytes32(merkleRoot);
+      return this.sendTxWithRetry(() => this.contract.unrevokeRoot(rootBytes32), "unrevokeMerkleRoot");
+    } catch (error) {
+      if (!this.blockchainRequired) {
+        return this.mockTransaction("pending");
+      }
+      throw error;
+    }
+  }
+
   public async issueDocument(documentHash: string): Promise<BlockchainTransaction> {
     if (this.testMode || this.mockMode) {
       return this.mockTransaction("confirmed");
@@ -275,6 +291,22 @@ export class BlockchainService {
     try {
       const docBytes32 = this.toBytes32(documentHash);
       return this.sendTxWithRetry(() => this.contract.revokeDocument(docBytes32), "revokeDocument");
+    } catch (error) {
+      if (!this.blockchainRequired) {
+        return this.mockTransaction("pending");
+      }
+      throw error;
+    }
+  }
+
+  public async unrevokeDocument(documentHash: string): Promise<BlockchainTransaction> {
+    if (this.testMode || this.mockMode) {
+      return this.mockTransaction("confirmed");
+    }
+
+    try {
+      const docBytes32 = this.toBytes32(documentHash);
+      return this.sendTxWithRetry(() => this.contract.unrevokeDocument(docBytes32), "unrevokeDocument");
     } catch (error) {
       if (!this.blockchainRequired) {
         return this.mockTransaction("pending");

@@ -39,8 +39,10 @@ contract DocuTrust {
 
     event RootStored(bytes32 indexed root, address indexed issuer, uint256 timestamp);
     event RootRevoked(bytes32 indexed root, address indexed revokedBy, uint256 timestamp);
+    event RootUnrevoked(bytes32 indexed root, address indexed unrevokedBy, uint256 timestamp);
     event DocumentIssued(bytes32 indexed docHash, address indexed issuer, uint256 timestamp);
     event DocumentRevoked(bytes32 indexed docHash, address indexed revokedBy, uint256 timestamp);
+    event DocumentUnrevoked(bytes32 indexed docHash, address indexed unrevokedBy, uint256 timestamp);
     event IssuerAdded(address indexed issuer);
     event IssuerRemoved(address indexed issuer);
 
@@ -136,6 +138,24 @@ contract DocuTrust {
         emit DocumentRevoked(root, msg.sender, block.timestamp);
     }
 
+    /**
+     * @notice Un-revoke a previously revoked Merkle root.
+     *         Only the original issuer or the contract owner can un-revoke.
+     */
+    function unrevokeRoot(bytes32 root) public {
+        require(validRoots[root], "DocuTrust: document does not exist");
+        require(revokedRoots[root], "DocuTrust: document not revoked");
+        require(
+            msg.sender == rootIssuers[root] || msg.sender == owner,
+            "DocuTrust: only issuer or owner can unrevoke"
+        );
+
+        revokedRoots[root] = false;
+
+        emit RootUnrevoked(root, msg.sender, block.timestamp);
+        emit DocumentUnrevoked(root, msg.sender, block.timestamp);
+    }
+
     // Backward-compatible wrappers. These now operate on roots.
     function issueDocument(bytes32 docHash) external onlyAuthorized {
         _storeRoot(docHash, msg.sender);
@@ -161,6 +181,10 @@ contract DocuTrust {
 
     function revokeDocument(bytes32 docHash) external {
         revokeRoot(docHash);
+    }
+
+    function unrevokeDocument(bytes32 docHash) external {
+        unrevokeRoot(docHash);
     }
 
     // ──────────────────────────────────────────────
