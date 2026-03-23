@@ -1,7 +1,9 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { Download, PlusCircle, LayoutDashboard, Loader2 } from "lucide-react";
+import html2canvas from "html2canvas";
+import { jsPDF } from "jspdf";
 import IssuerNavbar from "@/components/issuer-navbar";
 import CertificateTemplate from "../components/certificate-template";
 import { Button } from "@/components/ui/button";
@@ -40,6 +42,7 @@ export default function CertificatePreviewPage() {
   const { user } = useAuth();
   const { toast } = useToast();
   const issuerId = user?.id || "";
+  const [isDownloading, setIsDownloading] = useState(false);
 
   const isCurrentDraft = !certificateIdFromRoute || draft.certificateId === certificateIdFromRoute;
 
@@ -86,20 +89,73 @@ export default function CertificatePreviewPage() {
     };
   }, [data, draft, isCurrentDraft]);
 
-  const handleDownload = () => {
-    if (!previewData) {
+  const downloadCertificate = async () => {
+    const element = document.getElementById("certificate");
+    if (!element) {
+      toast({ title: "Error", description: "Certificate element not found", variant: "destructive" });
       return;
     }
 
-    if (previewData.imageDataUrl) {
-      const link = document.createElement("a");
-      link.download = `certificate-${previewData.recipientName.replace(/\s+/g, "-").toLowerCase()}-${previewData.certificateId}.png`;
-      link.href = previewData.imageDataUrl;
-      link.click();
-      return;
-    }
+    setIsDownloading(true);
 
-    window.print();
+    try {
+      await document.fonts.ready;
+      await new Promise((r) => setTimeout(r, 300));
+
+      const canvas = await html2canvas(element, {
+        scale: 3,
+        useCORS: true,
+        allowTaint: false,
+        backgroundColor: "#ffffff",
+        width: 760,
+        height: 900,
+        scrollX: 0,
+        scrollY: -window.scrollY,
+        onclone: (clonedDoc) => {
+          // Strip SVG url() filters that crash html2canvas
+          const el = clonedDoc.getElementById("certificate");
+          if (el) {
+            el.querySelectorAll<HTMLElement>("*").forEach((node) => {
+              const f = node.style?.filter;
+              if (f && f.includes("url(")) {
+                node.style.filter = "none";
+              }
+            });
+            // Also strip filter from the main content div
+            const contentDiv = el.querySelector<HTMLElement>('[style*="filter"]');
+            if (contentDiv && contentDiv.style.filter.includes("url(")) {
+              contentDiv.style.filter = "none";
+            }
+          }
+        },
+      });
+
+      if (!canvas || canvas.width === 0 || canvas.height === 0) {
+        throw new Error("Canvas rendering failed — empty result");
+      }
+
+      const imgData = canvas.toDataURL("image/jpeg", 1.0);
+
+      // PDF sized exactly to the certificate (760 x 900 px)
+      const pdf = new jsPDF({
+        orientation: "portrait",
+        unit: "px",
+        format: [760, 900],
+      });
+
+      pdf.addImage(imgData, "JPEG", 0, 0, 760, 900);
+      pdf.save("certificate.pdf");
+
+    } catch (error) {
+      console.error("Download failed:", error);
+      toast({
+        title: "Download failed",
+        description: error instanceof Error ? error.message : "Download failed. Please try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsDownloading(false);
+    }
   };
 
   const issueMutation = useMutation({
@@ -175,21 +231,19 @@ export default function CertificatePreviewPage() {
     : null;
 
   return (
-    <div className="min-h-screen bg-background print:bg-white">
-      <div className="print:hidden">
-        <IssuerNavbar />
-      </div>
+    <div className="min-h-screen bg-background">
+      <IssuerNavbar />
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 print:p-0">
-        <div className="print:hidden flex items-center justify-between mb-6 gap-3">
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div className="flex items-center justify-between mb-6 gap-3">
           <div>
             <h1 className="text-3xl font-bold text-foreground">Certificate Preview</h1>
             <p className="text-muted-foreground">Step 3 of 3: review, download, or issue another certificate.</p>
           </div>
           <div className="flex items-center gap-2">
-            <Button variant="outline" onClick={handleDownload} className="gap-2">
-              <Download className="h-4 w-4" />
-              Download
+            <Button variant="outline" onClick={downloadCertificate} disabled={isDownloading} className="gap-2">
+              {isDownloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+              {isDownloading ? "Capturing..." : "Download"}
             </Button>
             <Button
               variant="outline"
@@ -225,21 +279,21 @@ export default function CertificatePreviewPage() {
         </div>
 
         {isLoading && (
-          <Card className="print:hidden">
+          <Card>
             <CardContent className="py-10 text-center text-muted-foreground">Loading certificate preview...</CardContent>
           </Card>
         )}
 
         {!isLoading && !previewData && (
-          <Card className="print:hidden">
+          <Card>
             <CardContent className="py-10 text-center text-destructive">Certificate not found for preview.</CardContent>
           </Card>
         )}
 
         {previewData && certificateData && (
-          <div className="overflow-auto rounded-lg border bg-card p-4 print:border-0 print:p-0 print:bg-white">
-            <div className="min-w-[820px] print:min-w-0 flex justify-center">
-              <CertificateTemplate data={certificateData} />
+          <div className="rounded-lg border bg-card p-4 overflow-x-auto">
+            <div className="w-full bg-white flex justify-center" style={{ minWidth: "800px", padding: "20px" }}>
+              <CertificateTemplate id="certificate" data={certificateData} />
             </div>
           </div>
         )}

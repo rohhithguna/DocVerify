@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { PenLine, Upload, Image as ImageIcon } from "lucide-react";
+import { PenLine, Upload, Image as ImageIcon, ArrowLeft, ArrowRight, ShieldCheck, Undo2, Eraser, CheckCircle2 } from "lucide-react";
 import IssuerNavbar from "@/components/issuer-navbar";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
+import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { useIssuerCertificateDraft } from "@/context/issuer-certificate-draft";
 
@@ -14,113 +15,107 @@ export default function CertificateSignPage() {
 
   const signatureCanvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  
   const lastPointRef = useRef<{ x: number; y: number } | null>(null);
   const strokeStartedRef = useRef(false);
-  const [isDrawMode, setIsDrawMode] = useState(false);
+  
+  const [activeTab, setActiveTab] = useState<"draw" | "upload">("draw");
+  const [isDrawing, setIsDrawing] = useState(false);
   const [strokeWidth, setStrokeWidth] = useState(2.5);
   const [undoStack, setUndoStack] = useState<Array<{ dataUrl: string; hadStroke: boolean }>>([]);
   const [hasCanvasStroke, setHasCanvasStroke] = useState(false);
 
+  // Initialize Canvas
   useEffect(() => {
     const canvas = signatureCanvasRef.current;
-    if (!canvas) {
-      return;
-    }
-
+    if (!canvas) return;
     const context = canvas.getContext("2d");
-    if (!context) {
-      return;
-    }
+    if (!context) return;
 
-    context.lineWidth = strokeWidth;
+    // Scale stroke visually since raw canvas is 1400px wide
+    context.lineWidth = strokeWidth * 3;
     context.lineCap = "round";
     context.lineJoin = "round";
     context.strokeStyle = "#111827";
-  }, [strokeWidth]);
+  }, [strokeWidth, activeTab]);
 
   const getPointerPosition = (event: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = signatureCanvasRef.current;
-    if (!canvas) {
-      return { x: 0, y: 0 };
-    }
-
+    if (!canvas) return { x: 0, y: 0 };
     const rect = canvas.getBoundingClientRect();
+    
+    // Scale accurately mapping DOM pixels to Canvas internal coordinate pixels
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    
     return {
-      x: event.clientX - rect.left,
-      y: event.clientY - rect.top,
+      x: (event.clientX - rect.left) * scaleX,
+      y: (event.clientY - rect.top) * scaleY,
     };
   };
 
   const persistCanvasToDraft = () => {
     const canvas = signatureCanvasRef.current;
-    if (!canvas) {
-      return;
-    }
-
+    if (!canvas) return;
     updateDraft({ signatureDataUrl: canvas.toDataURL() });
   };
 
-  const drawSmoothedSegment = (nextPoint: { x: number; y: number }) => {
+  const startDrawing = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    event.preventDefault();
     const canvas = signatureCanvasRef.current;
-    if (!canvas) {
-      return;
-    }
-
-    const context = canvas.getContext("2d");
-    if (!context) {
-      return;
-    }
-
-    const lastPoint = lastPointRef.current;
-    if (!lastPoint) {
-      lastPointRef.current = nextPoint;
-      return;
-    }
+    const ctx = canvas?.getContext("2d");
+    if (!canvas || !ctx) return;
 
     if (!strokeStartedRef.current) {
-      setUndoStack((previous) => [
-        ...previous.slice(-19),
-        { dataUrl: canvas.toDataURL(), hadStroke: hasCanvasStroke },
-      ]);
+      setUndoStack((prev) => [...prev.slice(-19), { dataUrl: canvas.toDataURL(), hadStroke: hasCanvasStroke }]);
       strokeStartedRef.current = true;
     }
 
-    const midX = (lastPoint.x + nextPoint.x) / 2;
-    const midY = (lastPoint.y + nextPoint.y) / 2;
+    setIsDrawing(true);
+    const pos = getPointerPosition(event);
+    ctx.beginPath();
+    ctx.moveTo(pos.x, pos.y);
+    ctx.lineTo(pos.x, pos.y); // Creates a dot immediately on touch
+    ctx.stroke();
+    lastPointRef.current = pos;
+  };
 
-    context.beginPath();
-    context.moveTo(lastPoint.x, lastPoint.y);
-    context.quadraticCurveTo(lastPoint.x, lastPoint.y, midX, midY);
-    context.stroke();
+  const draw = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!isDrawing) return;
+    event.preventDefault();
+    
+    const canvas = signatureCanvasRef.current;
+    const ctx = canvas?.getContext("2d");
+    if (!ctx) return;
 
-    lastPointRef.current = nextPoint;
-    setHasCanvasStroke(true);
+    const pos = getPointerPosition(event);
+    ctx.lineTo(pos.x, pos.y);
+    ctx.stroke();
+    lastPointRef.current = pos;
+    
+    if (!hasCanvasStroke) setHasCanvasStroke(true);
+  };
+
+  const stopDrawing = () => {
+    if (!isDrawing) return;
+    setIsDrawing(false);
+    strokeStartedRef.current = false;
+    persistCanvasToDraft();
   };
 
   const clearCanvasPixels = () => {
     const canvas = signatureCanvasRef.current;
-    if (!canvas) {
-      return;
-    }
-
+    if (!canvas) return;
     const context = canvas.getContext("2d");
-    if (!context) {
-      return;
-    }
-
+    if (!context) return;
     context.clearRect(0, 0, canvas.width, canvas.height);
   };
 
   const restoreSnapshot = (snapshot: { dataUrl: string; hadStroke: boolean }) => {
     const canvas = signatureCanvasRef.current;
-    if (!canvas) {
-      return;
-    }
-
+    if (!canvas) return;
     const context = canvas.getContext("2d");
-    if (!context) {
-      return;
-    }
+    if (!context) return;
 
     const image = new Image();
     image.onload = () => {
@@ -132,40 +127,11 @@ export default function CertificateSignPage() {
     image.src = snapshot.dataUrl;
   };
 
-  const handleCanvasPointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    event.preventDefault();
-
-    const point = getPointerPosition(event);
-    lastPointRef.current = point;
-    strokeStartedRef.current = false;
-
-    if (isDrawMode) {
-      setIsDrawMode(false);
-      persistCanvasToDraft();
-      return;
-    }
-
-    setIsDrawMode(true);
-  };
-
-  const handleCanvasPointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!isDrawMode) {
-      return;
-    }
-
-    event.preventDefault();
-    const point = getPointerPosition(event);
-    drawSmoothedSegment(point);
-  };
-
   const handleUndo = () => {
-    if (undoStack.length === 0) {
-      return;
-    }
-
+    if (undoStack.length === 0) return;
     const snapshot = undoStack[undoStack.length - 1];
     setUndoStack((previous) => previous.slice(0, -1));
-    setIsDrawMode(false);
+    setIsDrawing(false);
     lastPointRef.current = null;
     strokeStartedRef.current = false;
     restoreSnapshot(snapshot);
@@ -175,13 +141,11 @@ export default function CertificateSignPage() {
     clearCanvasPixels();
     updateDraft({ signatureDataUrl: "" });
     setHasCanvasStroke(false);
-    setIsDrawMode(false);
+    setIsDrawing(false);
     setUndoStack([]);
     lastPointRef.current = null;
     strokeStartedRef.current = false;
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
-    }
+    if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
   const handleUploadClick = () => {
@@ -190,9 +154,7 @@ export default function CertificateSignPage() {
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
-    if (!file) {
-      return;
-    }
+    if (!file) return;
 
     const isSupported = ["image/png", "image/jpeg", "image/jpg"].includes(file.type);
     if (!isSupported) {
@@ -207,23 +169,13 @@ export default function CertificateSignPage() {
     const reader = new FileReader();
     reader.onload = () => {
       const dataUrl = typeof reader.result === "string" ? reader.result : "";
-      if (!dataUrl) {
-        toast({
-          title: "Upload failed",
-          description: "Could not read the uploaded file.",
-          variant: "destructive",
-        });
-        return;
-      }
+      if (!dataUrl) return;
 
-      const canvas = signatureCanvasRef.current;
-      if (canvas) {
+      if (signatureCanvasRef.current) {
         clearCanvasPixels();
         setHasCanvasStroke(false);
-        setIsDrawMode(false);
+        setIsDrawing(false);
         setUndoStack([]);
-        lastPointRef.current = null;
-        strokeStartedRef.current = false;
       }
 
       updateDraft({ signatureDataUrl: dataUrl });
@@ -231,33 +183,15 @@ export default function CertificateSignPage() {
     reader.readAsDataURL(file);
   };
 
-  const clearCanvas = () => {
-    clearCanvasPixels();
-    setHasCanvasStroke(false);
-    setIsDrawMode(false);
-    setUndoStack([]);
-    lastPointRef.current = null;
-    strokeStartedRef.current = false;
-    updateDraft({ signatureDataUrl: "" });
-  };
-
   const handleNext = () => {
-    if (!draft.hasPreview || !draft.certificateId) {
-      toast({
-        title: "Complete previous step first",
-        description: "Please provide certificate details before signing.",
-        variant: "destructive",
-      });
+    if (!draft.certificateId) {
+      toast({ title: "Incomplete", description: "Certificate details missing.", variant: "destructive" });
       navigate("/certificate/create");
       return;
     }
 
     if (!draft.signatureDataUrl) {
-      toast({
-        title: "Signature required",
-        description: "Please sign in the signature pad before continuing.",
-        variant: "destructive",
-      });
+      toast({ title: "Signature Required", description: "Please sign before finalizing.", variant: "destructive" });
       return;
     }
 
@@ -265,146 +199,174 @@ export default function CertificateSignPage() {
   };
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="min-h-screen bg-[#f8fafc] font-sans text-[#111827] pb-24 overflow-x-hidden">
       <IssuerNavbar />
-      <main className="w-full px-4 sm:px-6 lg:px-8 py-8">
-        <div className="mb-8">
-          <h1 className="text-3xl font-bold text-foreground">Signature</h1>
-          <p className="text-muted-foreground">Step 2 of 3: capture issuer signature and continue to preview.</p>
+      
+      <main className="max-w-[840px] w-full mx-auto px-6 py-12 relative z-10">
+        <div className="mb-10 w-full animate-in fade-in duration-500">
+          <Button variant="ghost" onClick={() => navigate("/certificate/create")} className="mb-6 -ml-4 text-[#6b7280] hover:text-[#111827] hover:bg-transparent px-4 transition-colors">
+            <ArrowLeft className="w-4 h-4 mr-2" />
+            Back to Details
+          </Button>
+          <h1 className="text-3xl font-bold tracking-tight text-[#111827] mb-2">Digital Signature</h1>
+          <p className="text-[#6b7280]">Provide the cryptographically binding issuer signature to authenticate this document.</p>
         </div>
 
-        {!draft.hasPreview && (
-          <Card className="mb-6 border-destructive/40">
-            <CardContent className="py-4 flex items-center justify-between">
-              <p className="text-sm text-destructive">Certificate details are incomplete. Create a draft before signing.</p>
-              <Button variant="outline" onClick={() => navigate("/certificate/create")}>Go to Details</Button>
-            </CardContent>
-          </Card>
-        )}
-
-        <div className="grid grid-cols-1 xl:grid-cols-[3fr_1fr] gap-6 items-start">
-          <div className="space-y-6">
-            <Card>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <PenLine className="h-5 w-5" />
-                  Digital Signature
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-                  <div className="text-sm text-muted-foreground">
-                    Click once to {isDrawMode ? "stop" : "start"} draw mode, then move mouse or touch to sign.
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <label htmlFor="stroke-width" className="text-sm text-muted-foreground">Stroke width</label>
-                    <input
-                      id="stroke-width"
-                      type="range"
-                      min={1}
-                      max={8}
-                      step={0.5}
-                      value={strokeWidth}
-                      onChange={(event) => setStrokeWidth(Number(event.target.value))}
-                      className="w-28"
-                    />
-                    <span className="w-10 text-right text-sm font-medium text-foreground">{strokeWidth.toFixed(1)}</span>
-                  </div>
-                </div>
-                <div className="border rounded-lg bg-white p-3">
-                  <canvas
-                    ref={signatureCanvasRef}
-                    width={1400}
-                    height={420}
-                    className={`w-full min-h-[400px] h-[48vh] max-h-[560px] border border-dashed rounded touch-none ${isDrawMode ? "border-emerald-500 cursor-crosshair" : "border-gray-300 cursor-pointer"}`}
-                    onPointerDown={handleCanvasPointerDown}
-                    onPointerMove={handleCanvasPointerMove}
-                  />
-                </div>
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <Button variant="outline" onClick={handleUndo} disabled={undoStack.length === 0}>
-                      Undo
-                    </Button>
-                    <Button variant="outline" onClick={clearCanvas} disabled={!hasCanvasStroke}>
-                      Clear
-                    </Button>
-                  </div>
-                  <Button variant="outline" onClick={() => navigate("/certificate/create")}>Back to Details</Button>
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle>Finalize</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="text-sm text-muted-foreground">
-                  Issuer: <span className="text-foreground font-medium">{draft.issuerName || "-"}</span>
-                </div>
-                <div className="text-sm text-muted-foreground">
-                  Certificate ID: <span className="text-foreground font-medium">{draft.certificateId || "-"}</span>
-                </div>
-                <Button
-                  className="w-full"
-                  onClick={handleNext}
-                  disabled={!draft.hasPreview || !draft.signatureDataUrl}
-                  data-testid="button-go-preview"
+        <Card className="rounded-[12px] border border-[#e5e7eb] shadow-[0_4px_20px_rgba(0,0,0,0.04)] bg-[#ffffff] overflow-hidden animate-in slide-in-from-bottom-4 duration-500">
+          <CardContent className="p-8 sm:p-10 min-h-[500px] flex flex-col justify-between relative">
+            
+            <div className="w-full">
+              {/* Tab Navigation */}
+              <div className="flex bg-[#f3f4f6] p-1.5 rounded-[12px] w-full max-w-[440px] mb-10 mx-auto">
+                <button 
+                  onClick={() => setActiveTab('draw')} 
+                  className={`flex-1 rounded-[8px] py-2.5 text-sm font-bold transition-all duration-300 flex items-center justify-center gap-2.5 ${activeTab === 'draw' ? 'bg-white shadow-[0_2px_8px_rgba(0,0,0,0.08)] text-[#111827]' : 'text-[#6b7280] hover:text-[#111827]'}`}
                 >
-                  Continue to Certificate Preview
-                </Button>
-              </CardContent>
-            </Card>
-          </div>
+                  <PenLine className="w-4 h-4" /> Draw Signature
+                </button>
+                <button 
+                  onClick={() => setActiveTab('upload')} 
+                  className={`flex-1 rounded-[8px] py-2.5 text-sm font-bold transition-all duration-300 flex items-center justify-center gap-2.5 ${activeTab === 'upload' ? 'bg-white shadow-[0_2px_8px_rgba(0,0,0,0.08)] text-[#111827]' : 'text-[#6b7280] hover:text-[#111827]'}`}
+                >
+                   <Upload className="w-4 h-4" /> Upload Image
+                </button>
+              </div>
 
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base flex items-center gap-2">
-                <Upload className="h-4 w-4" />
-                Upload Signature
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/png,image/jpeg,image/jpg"
-                className="hidden"
-                onChange={handleFileUpload}
-              />
-
-              <Button className="w-full gap-2" variant="outline" onClick={handleUploadClick}>
-                <Upload className="h-4 w-4" />
-                Upload PNG or JPG
-              </Button>
-
-              <div className="rounded-lg border bg-muted/20 p-3 min-h-[210px] flex items-center justify-center">
-                {draft.signatureDataUrl ? (
-                  <img
-                    src={draft.signatureDataUrl}
-                    alt="Signature preview"
-                    className="max-h-[180px] w-full object-contain"
-                  />
-                ) : (
-                  <div className="text-sm text-muted-foreground text-center space-y-2">
-                    <ImageIcon className="h-6 w-6 mx-auto" />
-                    <p>No uploaded signature yet</p>
+              {/* Draw Tab */}
+              {activeTab === 'draw' && (
+                <div className="space-y-4 animate-in fade-in zoom-in-95 duration-300">
+                  <div className="flex flex-col sm:flex-row sm:items-end justify-between px-1 gap-4">
+                    <div className="flex items-center gap-4">
+                      <Label className="text-[11px] font-bold uppercase tracking-wider text-[#6b7280]">Stroke Thickness</Label>
+                      <input
+                        type="range"
+                        min={1}
+                        max={8}
+                        step={0.5}
+                        value={strokeWidth}
+                        onChange={(event) => setStrokeWidth(Number(event.target.value))}
+                        className="w-32 accent-[#111827]"
+                      />
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Button variant="ghost" onClick={handleUndo} disabled={undoStack.length === 0} className="h-9 px-4 text-[#6b7280] hover:text-[#111827] bg-[#f8fafc] hover:bg-[#f3f4f6] rounded-[8px] font-semibold transition-all duration-200 hover:shadow-sm">
+                        <Undo2 className="w-4 h-4 mr-2" /> Undo
+                      </Button>
+                      <Button variant="ghost" onClick={clearSignature} disabled={!hasCanvasStroke} className="h-9 px-4 text-red-600 hover:text-red-700 bg-red-50 hover:bg-red-100 rounded-[8px] font-semibold transition-all duration-200 hover:shadow-sm">
+                           <Eraser className="w-4 h-4 mr-2" /> Clear
+                      </Button>
+                    </div>
                   </div>
-                )}
+
+                  <div 
+                    className={`relative border-2 border-dashed rounded-[12px] bg-[#fafafa] overflow-hidden transition-all duration-300 ${
+                      isDrawing ? 'border-[#3b82f6] shadow-[0_0_0_4px_rgba(59,130,246,0.1)]' : 'border-[#d1d5db] hover:border-[#9ca3af]'
+                    }`}
+                  >
+                    <canvas
+                      ref={signatureCanvasRef}
+                      width={1400}
+                      height={460}
+                      className="w-full h-[320px] touch-none cursor-crosshair z-10 relative"
+                      onPointerDown={startDrawing}
+                      onPointerMove={draw}
+                      onPointerUp={stopDrawing}
+                      onPointerLeave={stopDrawing}
+                    />
+                    
+                    {!hasCanvasStroke && !isDrawing && (
+                      <div className="absolute inset-0 pointer-events-none flex flex-col items-center justify-center text-[#9ca3af] z-0 animate-in fade-in duration-700">
+                        <PenLine className="w-8 h-8 mb-3 opacity-50 text-[#d1d5db]" />
+                        <span className="text-xl font-medium tracking-tight text-[#d1d5db]">Sign here</span>
+                      </div>
+                    )}
+
+                    {hasCanvasStroke && !isDrawing && (
+                      <div className="absolute top-4 right-4 pointer-events-none bg-green-50 text-green-600 px-3 py-1.5 rounded-full flex items-center gap-1.5 shadow-sm border border-green-100 animate-in fade-in slide-in-from-top-2">
+                        <CheckCircle2 className="w-4 h-4" />
+                        <span className="text-[11px] font-bold uppercase tracking-wider">Captured</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Upload Tab */}
+              {activeTab === 'upload' && (
+                <div className="space-y-6 animate-in fade-in zoom-in-95 duration-300 max-w-[500px] mx-auto">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/png,image/jpeg,image/jpg"
+                    className="hidden"
+                    onChange={handleFileUpload}
+                  />
+
+                  <div className="border-2 border-dashed border-[#e5e7eb] rounded-[12px] bg-[#fafafa] p-4 h-[320px] flex flex-col items-center justify-center transition-all hover:border-[#d1d5db]">
+                    {draft.signatureDataUrl && !hasCanvasStroke ? (
+                      <img
+                        src={draft.signatureDataUrl}
+                        alt="Signature preview"
+                        className="max-h-[260px] w-full object-contain filter contrast-125 mix-blend-multiply"
+                      />
+                    ) : (
+                      <div className="text-center space-y-4">
+                        <div className="w-16 h-16 bg-white border border-[#e5e7eb] rounded-full flex items-center justify-center mx-auto shadow-sm">
+                          <ImageIcon className="h-6 w-6 text-[#9ca3af]" />
+                        </div>
+                        <div className="space-y-1">
+                          <p className="font-semibold text-[#111827]">No signature uploaded</p>
+                          <p className="text-sm text-[#6b7280]">Supports transparent PNG or JPEG.</p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <Button className="flex-1 h-11 rounded-[8px] bg-white border border-[#e5e7eb] text-[#111827] hover:bg-[#f3f4f6] font-semibold flex items-center gap-2 transition-all duration-200 hover:shadow-md" variant="outline" onClick={handleUploadClick}>
+                      <Upload className="h-4 w-4" />
+                      {draft.signatureDataUrl && !hasCanvasStroke ? "Replace File" : "Choose File"}
+                    </Button>
+                    {(draft.signatureDataUrl && !hasCanvasStroke) && (
+                       <Button className="flex-1 h-11 rounded-[8px] bg-red-50 text-red-600 border border-transparent hover:bg-red-100 font-semibold transition-all duration-200 hover:shadow-md" variant="outline" onClick={clearSignature}>
+                         Clear Image
+                       </Button>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Trust Box */}
+              <div className="mt-8 flex items-start gap-3.5 p-5 rounded-[12px] bg-[#f8fafc] border border-[#e5e7eb] shadow-sm">
+                <ShieldCheck className="w-6 h-6 text-[#2563eb] shrink-0 mt-0.5" />
+                <p className="text-[14px] text-[#4b5563] leading-relaxed">
+                  <strong className="text-[#111827]">Cryptographic Binding:</strong> This signature will be securely embedded into the visual template and mathematically hashed onto the blockchain registry. Ensure it represents the authorized issuer.
+                </p>
               </div>
 
-              <div className="flex items-center gap-2">
-                <Button className="flex-1" variant="outline" onClick={handleUploadClick}>
-                  Replace
-                </Button>
-                <Button className="flex-1" variant="outline" onClick={clearSignature} disabled={!draft.signatureDataUrl && !hasCanvasStroke}>
-                  Clear All
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
+            </div>
+
+            {/* NAVIGATION FOOTER */}
+            <div className={`mt-10 pt-6 border-t border-[#e5e7eb] flex items-center justify-between w-full`}>
+              <Button 
+                onClick={() => navigate("/certificate/create")} 
+                variant="outline" 
+                className="h-11 px-6 rounded-[8px] font-semibold border-[#e5e7eb] text-[#111827] hover:bg-[#f3f4f6] transition-all duration-200 hover:shadow-md hover:-translate-y-0.5"
+              >
+                Back to Details
+              </Button>
+              
+              <Button 
+                onClick={handleNext} 
+                disabled={!draft.signatureDataUrl}
+                className="h-11 px-8 rounded-[8px] font-semibold bg-[#111827] text-white hover:bg-[#000000] shadow-[0_4px_14px_rgba(0,0,0,0.06)] hover:shadow-[0_8px_30px_rgba(0,0,0,0.12)] transition-all duration-200 hover:-translate-y-[2px] disabled:opacity-50 disabled:pointer-events-none disabled:hover:translate-y-0"
+              >
+                Continue to Preview <ArrowRight className="w-4 h-4 ml-2" />
+              </Button>
+            </div>
+            
+          </CardContent>
+        </Card>
       </main>
     </div>
   );

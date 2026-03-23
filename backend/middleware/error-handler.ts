@@ -108,6 +108,25 @@ export const errorHandler: ErrorRequestHandler = (
         });
     }
 
+    // Handle database/ORM errors
+    if ((err as any).code === '23505') {
+        return res.status(409).json({
+            success: false,
+            error: "Resource already exists",
+            code: "UNIQUE_CONSTRAINT_VIOLATION",
+            message: "Resource already exists",
+        });
+    }
+
+    if ((err as any).code === '23503') {
+        return res.status(400).json({
+            success: false,
+            error: "Invalid reference",
+            code: "FOREIGN_KEY_VIOLATION",
+            message: "Referenced resource does not exist",
+        });
+    }
+
     // Handle unknown/programming errors
     // Don't leak error details in production
     const message = process.env.NODE_ENV === 'production'

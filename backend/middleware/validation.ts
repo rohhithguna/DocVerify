@@ -118,6 +118,12 @@ export const revokeBodySchema = z.object({
     batchId: z.string().uuid("Invalid batch ID format"),
 });
 
+function isValidDate(dateStr: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return false;
+  const date = new Date(dateStr);
+  return date instanceof Date && !isNaN(date.getTime());
+}
+
 const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
 const sha256Regex = /^[a-fA-F0-9]{64}$/;
 const ethereumAddressRegex = /^0x[a-fA-F0-9]{40}$/;
@@ -135,7 +141,7 @@ const createCertificateBatchItemSchema = z.object({
         .min(1, "Issuer is required")
         .max(200, "Issuer too long"),
     date: z.string()
-        .regex(dateRegex, "Invalid date format (use YYYY-MM-DD)")
+        .refine(isValidDate, "Invalid date format (use YYYY-MM-DD)")
         .optional()
         .default(() => new Date().toISOString().split('T')[0]),
     certificateId: z.string()
@@ -148,7 +154,10 @@ export const createCertificateBodySchema = z.object({
     holder: z.object({
         name: z.string().trim().min(3, "holder.name must be at least 3 characters").max(200),
         studentId: z.string().trim().min(1, "holder.studentId is required").max(100),
-        email: z.string().email("holder.email must be a valid email address").optional(),
+        email: z.string()
+          .email("holder.email must be a valid email address")
+          .refine(e => /^[^@\s]{1,64}@[^@\s]{1,255}\.[a-zA-Z]{2,}$/.test(e), "Invalid email format")
+          .optional(),
     }),
     certificateDetails: z.object({
         certificateId: z.string().trim().min(1, "certificateDetails.certificateId is required").max(100),
@@ -162,11 +171,17 @@ export const createCertificateBodySchema = z.object({
     issuer: z.object({
         issuerName: z.string().trim().min(1, "issuer.issuerName is required").max(200),
         issuerId: z.string().trim().min(1, "issuer.issuerId is required").max(100),
-        issuerWallet: z.string().trim().regex(ethereumAddressRegex, "issuer.issuerWallet must be a valid Ethereum address"),
+        issuerWallet: z.string()
+          .trim()
+          .regex(ethereumAddressRegex, "issuer.issuerWallet must be a valid Ethereum address")
+          .refine(addr => {
+            if (!/^0x[0-9a-f]{40}$/.test(addr)) return !/^0x[0-9A-F]{40}$/.test(addr);
+            return true;
+          }, "Ethereum address checksum may be invalid"),
     }),
     validity: z.object({
-        issueDate: z.string().regex(dateRegex, "validity.issueDate must use YYYY-MM-DD"),
-        expiryDate: z.string().regex(dateRegex, "validity.expiryDate must use YYYY-MM-DD"),
+        issueDate: z.string().refine(isValidDate, "validity.issueDate must be a valid date (YYYY-MM-DD)"),
+        expiryDate: z.string().refine(isValidDate, "validity.expiryDate must be a valid date (YYYY-MM-DD)"),
         status: z.enum(["ACTIVE", "REVOKED"], {
             errorMap: () => ({ message: "validity.status must be ACTIVE or REVOKED" }),
         }),

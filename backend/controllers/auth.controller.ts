@@ -15,17 +15,31 @@ export async function register(req: Request, res: Response) {
   try {
     const { email, password, name, organization } = req.body;
     const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
+    const normalizedName = typeof name === "string" ? name.trim() : "";
+    const normalizedOrganization = typeof organization === "string" ? organization.trim() : "";
 
-    if (!normalizedEmail || !password || !name) {
+    if (!normalizedEmail || !password || !normalizedName) {
       return res.status(400).json({
         error: "Missing required fields",
         required: ["email", "password", "name"],
       });
     }
 
-    if (password.length < 6) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
       return res.status(400).json({
-        error: "Password must be at least 6 characters",
+        error: "Invalid email format",
+      });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({
+        error: "Password must be at least 8 characters",
+      });
+    }
+
+    if (normalizedName.length > 200) {
+      return res.status(400).json({
+        error: "Name is too long",
       });
     }
 
@@ -40,8 +54,8 @@ export async function register(req: Request, res: Response) {
     const user = await storage.createUser({
       email: normalizedEmail,
       passwordHash,
-      name,
-      organization: organization || null,
+      name: normalizedName,
+      organization: normalizedOrganization || null,
       role: "issuer",
     });
 
@@ -72,9 +86,15 @@ export async function login(req: Request, res: Response) {
     const { email, password } = req.body;
     const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
 
-    if (!normalizedEmail || !password) {
+    if (!normalizedEmail || typeof password !== "string" || !password) {
       return res.status(400).json({
         error: "Email and password are required",
+      });
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+      return res.status(400).json({
+        error: "Invalid email format",
       });
     }
 

@@ -1,6 +1,7 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { useMutation } from "@tanstack/react-query";
 import html2canvas from "html2canvas";
+import { jsPDF } from "jspdf";
 import QRCode from "qrcode";
 import { Download, Award, Loader2, Undo2, Upload, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -9,6 +10,7 @@ import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest, queryClient } from "@/lib/queryClient";
+import { useIssuerCertificateDraft } from "@/context/issuer-certificate-draft";
 import CertificateTemplate from "./certificate-template";
 
 interface CertificateFormProps {
@@ -62,46 +64,34 @@ interface PreviewData {
 }
 
 export default function CertificateForm({ issuerId, onCertificateCreated }: CertificateFormProps) {
-    const [recipientName, setRecipientName] = useState("");
-    const [recipientEmail, setRecipientEmail] = useState("");
-    const [studentId, setStudentId] = useState("");
-    const [certificateTitle, setCertificateTitle] = useState("of Achievement");
-    const [eventName, setEventName] = useState("");
-    const [issueDate, setIssueDate] = useState(new Date().toISOString().split('T')[0]);
-    const [expiryDate, setExpiryDate] = useState(() => {
-        const date = new Date();
-        date.setFullYear(date.getFullYear() + 1);
-        return date.toISOString().split('T')[0];
-    });
-    const [issuerName, setIssuerName] = useState("");
-    const [issuerWallet, setIssuerWallet] = useState("0x1234567890abcdef1234567890ABCDEF12345678");
-    const [certificateId, setCertificateId] = useState("");
+    // Use context for persistent certificate data
+    const { draft, updateDraft } = useIssuerCertificateDraft();
+
+    // UI-only state (not persisted)
     const [generatedCertificate, setGeneratedCertificate] = useState<string | null>(null);
-    const [qrCodeDataUrl, setQrCodeDataUrl] = useState<string | null>(null);
     const [previewData, setPreviewData] = useState<PreviewData | null>(null);
     const [isSigned, setIsSigned] = useState(false);
     const [isGeneratingPreview, setIsGeneratingPreview] = useState(false);
     const [currentStep, setCurrentStep] = useState<"details" | "preview" | "issued">("details");
-    const [signatureDataUrl, setSignatureDataUrl] = useState<string>("");
-    const [isDrawing, setIsDrawing] = useState(false);
     const [isSigningInProgress, setIsSigningInProgress] = useState(false);
-    const [drawingMode, setDrawingMode] = useState(false); // Toggle mode: click to start/stop
-    const [strokes, setStrokes] = useState<ImageData[]>([]); // Store strokes for undo
-    const [uploadedSignature, setUploadedSignature] = useState<string>(""); // For uploaded images
-    const [signatureMode, setSignatureMode] = useState<"draw" | "upload">("draw"); // Track signature source
-    const [lastPoint, setLastPoint] = useState<{ x: number; y: number } | null>(null); // For smooth line drawing
+    const [drawingMode, setDrawingMode] = useState(false);
+    const [strokes, setStrokes] = useState<ImageData[]>([]);
+    const [uploadedSignature, setUploadedSignature] = useState<string>("");
+    const [signatureMode, setSignatureMode] = useState<"draw" | "upload">("draw");
+    const [lastPoint, setLastPoint] = useState<{ x: number; y: number } | null>(null);
+    const [isDrawing, setIsDrawing] = useState(false);
 
     const certificateRef = useRef<HTMLDivElement>(null);
     const signatureCanvasRef = useRef<HTMLCanvasElement>(null);
     const uploadInputRef = useRef<HTMLInputElement>(null);
     const { toast } = useToast();
 
-    // Generate unique certificate ID
-    const generateCertificateId = () => {
+    // Simplified certificate ID generation
+    const generateCertificateId = useCallback(() => {
         const timestamp = Date.now().toString(36).toUpperCase();
         const random = Math.random().toString(36).substring(2, 6).toUpperCase();
         return `CERT-${timestamp}-${random}`;
-    };
+    }, []);
 
     // Initialize signature canvas with DPI scaling
     const initializeSignatureCanvas = () => {
@@ -150,7 +140,7 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
             setCurrentStep("issued");
             toast({
                 title: "Certificate Created!",
-                description: `Certificate for ${recipientName} has been signed and stored on blockchain.`,
+                description: `Certificate for ${draft.recipientName} has been signed and stored on blockchain.`,
             });
             queryClient.invalidateQueries({ queryKey: ['/api/issuer', issuerId, 'batches'] });
             queryClient.invalidateQueries({ queryKey: ['/api/issuer', issuerId, 'stats'] });
@@ -171,37 +161,29 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
         },
     });
 
+    // Build payload using draft state from context
     const buildCertificatePayload = (certId: string): CertificatePayload => {
-        const verificationUrl = `${window.location.origin}/verify/${encodeURIComponent(certId)}`;
-        const signaturePayload = btoa(JSON.stringify({
-            name: recipientName,
-            studentId,
-            course: eventName,
-            issuerName,
-            issueDate,
-            certificateId: certId,
-        }));
-
+        updateDraft({ certificateId: certId });
         return {
             holder: {
-                name: recipientName,
-                studentId,
-                ...(recipientEmail ? { email: recipientEmail } : {}),
+                name: draft.recipientName,
+                studentId: draft.studentId,
+                ...(draft.recipientEmail ? { email: draft.recipientEmail } : {}),
             },
             certificateDetails: {
                 certificateId: certId,
-                course: eventName,
+                course: draft.eventName,
                 level: "Advanced",
                 duration: "12 weeks",
             },
             issuer: {
-                issuerName,
+                issuerName: draft.issuerName,
                 issuerId,
-                issuerWallet,
+                issuerWallet: draft.issuerWallet,
             },
             validity: {
-                issueDate,
-                expiryDate,
+                issueDate: draft.issueDate,
+                expiryDate: draft.expiryDate,
                 status: "ACTIVE",
             },
             security: {
@@ -209,11 +191,18 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
                 merkleRoot: "",
             },
             signature: {
-                signature: signaturePayload,
-                signedBy: issuerName,
+                signature: draft.signatureDataUrl || btoa(JSON.stringify({
+                    name: draft.recipientName,
+                    studentId: draft.studentId,
+                    course: draft.eventName,
+                    issuerName: draft.issuerName,
+                    issueDate: draft.issueDate,
+                    certificateId: certId,
+                })),
+                signedBy: draft.issuerName,
             },
             verification: {
-                qrCodeUrl: verificationUrl,
+                qrCodeUrl: `${window.location.origin}/verify/${encodeURIComponent(certId)}`,
             },
         };
     };
@@ -222,13 +211,13 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
         setIsGeneratingPreview(true);
         const missingFields: string[] = [];
 
-        if (!recipientName.trim()) missingFields.push("Recipient Name");
-        if (!studentId.trim()) missingFields.push("Student ID");
-        if (!eventName.trim()) missingFields.push("Event / Course Name");
-        if (!issueDate) missingFields.push("Issue Date");
-        if (!expiryDate) missingFields.push("Expiry Date");
-        if (!issuerName.trim()) missingFields.push("Issuer Name");
-        if (!issuerWallet.trim()) missingFields.push("Issuer Wallet");
+        if (!draft.recipientName.trim()) missingFields.push("Recipient Name");
+        if (!draft.studentId.trim()) missingFields.push("Student ID");
+        if (!draft.eventName.trim()) missingFields.push("Event / Course Name");
+        if (!draft.issueDate) missingFields.push("Issue Date");
+        if (!draft.expiryDate) missingFields.push("Expiry Date");
+        if (!draft.issuerName.trim()) missingFields.push("Issuer Name");
+        if (!draft.issuerWallet.trim()) missingFields.push("Issuer Wallet");
 
         if (missingFields.length > 0) {
             toast({
@@ -240,7 +229,7 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
             return;
         }
 
-        if (new Date(expiryDate).getTime() <= new Date(issueDate).getTime()) {
+        if (new Date(draft.expiryDate).getTime() <= new Date(draft.issueDate).getTime()) {
             toast({
                 title: "Invalid Dates",
                 description: "Expiry date must be after issue date.",
@@ -251,8 +240,8 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
         }
 
         // Generate certificate ID if not set
-        const certId = certificateId || generateCertificateId();
-        setCertificateId(certId);
+        const certId = draft.certificateId || generateCertificateId();
+        updateDraft({ certificateId: certId });
         setIsSigned(false);
 
         const qrPayload = `${window.location.origin}/verify/${encodeURIComponent(certId)}`;
@@ -262,10 +251,10 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
                 width: 220,
                 margin: 1,
             });
-            setQrCodeDataUrl(qrDataUrl);
+            updateDraft({ qrCodeDataUrl: qrDataUrl });
         } catch (error) {
             console.error("Failed to generate QR code:", error);
-            setQrCodeDataUrl(null);
+            updateDraft({ qrCodeDataUrl: "" });
             toast({
                 title: "QR Generation Failed",
                 description: "Could not generate QR code for this certificate.",
@@ -273,19 +262,36 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
             });
         }
 
-        // Wait for state to update
-        await new Promise(resolve => setTimeout(resolve, 100));
+        // Wait for state to update and fonts to be ready
+        await document.fonts.ready;
+        await new Promise(resolve => setTimeout(resolve, 300));
 
         // Generate certificate image locally (for preview/download only)
         if (certificateRef.current) {
             try {
+                // wait for full render
+                await document.fonts.ready;
+                await new Promise(r => setTimeout(r, 500));
+
                 const canvas = await html2canvas(certificateRef.current, {
-                    backgroundColor: "#ffffff",
                     scale: 2,
-                    logging: false,
+                    useCORS: true,
+                    allowTaint: false,
+                    backgroundColor: "#ffffff",
                 });
 
+                // VALIDATE canvas
+                if (!canvas || canvas.width === 0 || canvas.height === 0) {
+                    throw new Error("Canvas rendering failed");
+                }
+
                 const imageData = canvas.toDataURL("image/png");
+
+                // VALIDATE data
+                if (!imageData || !imageData.startsWith("data:image/png")) {
+                    throw new Error("Invalid PNG data");
+                }
+                
                 setGeneratedCertificate(imageData);
             } catch (error) {
                 console.error("Failed to generate certificate image:", error);
@@ -298,12 +304,12 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
         }
 
         setPreviewData({
-            name: recipientName,
-            course: eventName,
-            issuerName,
+            name: draft.recipientName,
+            course: draft.eventName,
+            issuerName: draft.issuerName,
             certificateId: certId,
-            issueDate,
-            expiryDate,
+            issueDate: draft.issueDate,
+            expiryDate: draft.expiryDate,
             payload: buildCertificatePayload(certId),
         });
         setCurrentStep("preview");
@@ -316,9 +322,8 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
     };
 
     const handleProceedToSign = () => {
-        // PROTECTION: Prevent double calls by blocking if already signing
+        // Prevent double calls by blocking if already signing
         if (isSigningInProgress) {
-            console.log("⚠️ DOUBLE_CALL_PROTECTION: Signing already in progress, ignoring click");
             return;
         }
 
@@ -326,7 +331,7 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
             return;
         }
 
-        if (!signatureDataUrl) {
+        if (!draft.signatureDataUrl) {
             toast({
                 title: "Signature Required",
                 description: "Please sign in the signature pad before issuing the certificate.",
@@ -343,45 +348,33 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
             ...previewData.payload,
             signature: {
                 ...previewData.payload.signature,
-                signature: signatureDataUrl,
+                signature: draft.signatureDataUrl,
             },
         };
 
-        // Debug: Log complete payload to verify all fields are present
-        console.log("📋 PAYLOAD_FIX: Certificate Creation Payload", {
-            holder: finalPayload.holder ? {
-                name: finalPayload.holder.name ? "✓" : "✗",
-                studentId: finalPayload.holder.studentId ? "✓" : "✗",
-                email: finalPayload.holder.email ? "✓" : "○",
-            } : "✗",
-            certificateDetails: finalPayload.certificateDetails ? {
-                certificateId: finalPayload.certificateDetails.certificateId ? "✓" : "✗",
-                course: finalPayload.certificateDetails.course ? "✓" : "✗",
-                level: finalPayload.certificateDetails.level ? "✓" : "✗",
-                duration: finalPayload.certificateDetails.duration ? "✓" : "✗",
-            } : "✗",
-            issuer: finalPayload.issuer ? {
-                issuerName: finalPayload.issuer.issuerName ? "✓" : "✗",
-                issuerId: finalPayload.issuer.issuerId ? "✓" : "✗",
-                issuerWallet: finalPayload.issuer.issuerWallet ? "✓" : "✗",
-            } : "✗",
-            validity: finalPayload.validity ? {
-                issueDate: finalPayload.validity.issueDate ? "✓" : "✗",
-                expiryDate: finalPayload.validity.expiryDate ? "✓" : "✗",
-                status: finalPayload.validity.status ? "✓" : "✗",
-            } : "✗",
-            security: finalPayload.security ? "✓" : "○",
-            signature: finalPayload.signature ? {
-                signature: finalPayload.signature.signature ? `✓ (${finalPayload.signature.signature.substring(0, 20)}...)` : "✗",
-                signedBy: finalPayload.signature.signedBy ? "✓" : "✗",
-            } : "✗",
-            verification: finalPayload.verification ? "✓" : "○",
-        });
+        // Verify all required fields are present before sending
+        const hasAllFields = finalPayload.holder?.name &&
+            finalPayload.holder?.studentId &&
+            finalPayload.certificateDetails?.certificateId &&
+            finalPayload.certificateDetails?.course &&
+            finalPayload.issuer?.issuerName &&
+            finalPayload.issuer?.issuerId &&
+            finalPayload.issuer?.issuerWallet &&
+            finalPayload.validity?.issueDate &&
+            finalPayload.validity?.expiryDate &&
+            finalPayload.signature?.signature &&
+            finalPayload.signature?.signedBy;
 
-        // Log full payload for debugging
-        console.log("🔍 Full Payload Structure:", JSON.stringify(finalPayload, null, 2));
+        if (!hasAllFields) {
+            setIsSigningInProgress(false);
+            toast({
+                title: "Incomplete Certificate",
+                description: "Some required fields are missing. Please review and try again.",
+                variant: "destructive",
+            });
+            return;
+        }
 
-        console.log("✅ DOUBLE_CALL_FIX: Single API call in progress");
         createCertificateMutation.mutate(finalPayload);
     };
 
@@ -451,7 +444,7 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
             // Save signature
             if (canvas) {
                 const newSignature = canvas.toDataURL();
-                setSignatureDataUrl(newSignature);
+                updateDraft({ signatureDataUrl: newSignature });
             }
         }
     };
@@ -520,7 +513,7 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
         const canvas = signatureCanvasRef.current;
         if (canvas) {
             const newSignature = canvas.toDataURL();
-            setSignatureDataUrl(newSignature);
+            updateDraft({ signatureDataUrl: newSignature });
         }
     };
 
@@ -532,7 +525,7 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
         if (!context) return;
 
         context.clearRect(0, 0, canvas.width, canvas.height);
-        setSignatureDataUrl("");
+        updateDraft({ signatureDataUrl: "" });
         setUploadedSignature("");
         setDrawingMode(false);
         setStrokes([]);
@@ -560,7 +553,7 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
         // Update signature
         if (canvas) {
             const newSignature = canvas.toDataURL();
-            setSignatureDataUrl(newSignature);
+            updateDraft({ signatureDataUrl: newSignature });
         }
     };
 
@@ -583,7 +576,7 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
             const imageUrl = e.target?.result as string;
             if (imageUrl) {
                 setUploadedSignature(imageUrl);
-                setSignatureDataUrl(imageUrl);
+                updateDraft({ signatureDataUrl: imageUrl });
                 setSignatureMode("upload");
                 setDrawingMode(false);
                 setStrokes([]);
@@ -626,29 +619,65 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
     };
 
     const handleDownload = () => {
-        if (generatedCertificate) {
-            const link = document.createElement("a");
-            link.download = `certificate-${recipientName.replace(/\s+/g, '-').toLowerCase()}-${certificateId}.png`;
-            link.href = generatedCertificate;
-            link.click();
+        if (!generatedCertificate) {
+             toast({
+                title: "Download Unavailable",
+                description: "The certificate image could not be generated.",
+                variant: "destructive"
+            });
+            return;
+        }
+        
+        try {
+            // Create a temporary image to get dimensions
+            const img = new Image();
+            img.onload = () => {
+                // Convert pixel dimensions to mm (at 96 DPI base, scaled by 2)
+                const pdfWidth = (img.width / (2 * 96)) * 25.4;
+                const pdfHeight = (img.height / (2 * 96)) * 25.4;
+
+                const orientation = pdfWidth > pdfHeight ? "landscape" : "portrait";
+                const pdf = new jsPDF({
+                    orientation,
+                    unit: "mm",
+                    format: [pdfWidth, pdfHeight],
+                });
+
+                pdf.addImage(generatedCertificate, "PNG", 0, 0, pdfWidth, pdfHeight);
+                pdf.save(`certificate-${draft.recipientName.replace(/\s+/g, '-').toLowerCase()}-${draft.certificateId}.pdf`);
+            };
+            img.src = generatedCertificate;
+        } catch (error) {
+            console.error("Download failed:", error);
+            toast({
+                title: "Download failed",
+                description: "Download failed. Please try again.",
+                variant: "destructive"
+            });
         }
     };
 
     const handleReset = () => {
-        setRecipientName("");
-        setRecipientEmail("");
-        setStudentId("");
-        setCertificateTitle("of Achievement");
-        setEventName("");
-        setIssueDate(new Date().toISOString().split('T')[0]);
-        const nextExpiry = new Date();
-        nextExpiry.setFullYear(nextExpiry.getFullYear() + 1);
-        setExpiryDate(nextExpiry.toISOString().split('T')[0]);
-        setIssuerName("");
-        setIssuerWallet("0x1234567890abcdef1234567890ABCDEF12345678");
-        setCertificateId("");
+        updateDraft({
+            recipientName: "",
+            recipientEmail: "",
+            studentId: "",
+            certificateTitle: "of Achievement",
+            eventName: "",
+            issueDate: new Date().toISOString().split('T')[0],
+            expiryDate: (() => {
+                const date = new Date();
+                date.setFullYear(date.getFullYear() + 1);
+                return date.toISOString().split('T')[0];
+            })(),
+            issuerName: "",
+            issuerWallet: "0x1234567890abcdef1234567890ABCDEF12345678",
+            certificateId: "",
+            generatedCertificateImage: "",
+            qrCodeDataUrl: "",
+            signatureDataUrl: "",
+        });
         setGeneratedCertificate(null);
-        setQrCodeDataUrl(null);
         setPreviewData(null);
         setIsSigned(false);
         setIsGeneratingPreview(false);
@@ -683,8 +712,8 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
                             <Label htmlFor="recipientName">Recipient Name *</Label>
                             <Input
                                 id="recipientName"
-                                value={recipientName}
-                                onChange={(e) => setRecipientName(e.target.value)}
+                                value={draft.recipientName}
+                                onChange={(e) => updateDraft({ recipientName: e.target.value })}
                                 disabled={isActionLocked}
                                 placeholder="Enter recipient's full name"
                                 data-testid="input-recipient-name"
@@ -696,8 +725,8 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
                             <Input
                                 id="recipientEmail"
                                 type="email"
-                                value={recipientEmail}
-                                onChange={(e) => setRecipientEmail(e.target.value)}
+                                value={draft.recipientEmail}
+                                onChange={(e) => updateDraft({ recipientEmail: e.target.value })}
                                 disabled={isActionLocked}
                                 placeholder="recipient@example.com"
                                 data-testid="input-recipient-email"
@@ -708,8 +737,8 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
                             <Label htmlFor="studentId">Student ID *</Label>
                             <Input
                                 id="studentId"
-                                value={studentId}
-                                onChange={(e) => setStudentId(e.target.value)}
+                                value={draft.studentId}
+                                onChange={(e) => updateDraft({ studentId: e.target.value })}
                                 disabled={isActionLocked}
                                 placeholder="e.g., SID-2026-001"
                                 data-testid="input-student-id"
@@ -720,8 +749,8 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
                             <Label htmlFor="certificateTitle">Certificate Title</Label>
                             <Input
                                 id="certificateTitle"
-                                value={certificateTitle}
-                                onChange={(e) => setCertificateTitle(e.target.value)}
+                                value={draft.certificateTitle}
+                                onChange={(e) => updateDraft({ certificateTitle: e.target.value })}
                                 disabled={isActionLocked}
                                 placeholder="e.g., of Achievement, of Completion"
                                 data-testid="input-certificate-title"
@@ -732,8 +761,8 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
                             <Label htmlFor="eventName">Event / Course Name *</Label>
                             <Input
                                 id="eventName"
-                                value={eventName}
-                                onChange={(e) => setEventName(e.target.value)}
+                                value={draft.eventName}
+                                onChange={(e) => updateDraft({ eventName: e.target.value })}
                                 disabled={isActionLocked}
                                 placeholder="e.g., Smart India Hackathon 2024"
                                 data-testid="input-event-name"
@@ -745,8 +774,8 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
                             <Input
                                 id="issueDate"
                                 type="date"
-                                value={issueDate}
-                                onChange={(e) => setIssueDate(e.target.value)}
+                                value={draft.issueDate}
+                                onChange={(e) => updateDraft({ issueDate: e.target.value })}
                                 disabled={isActionLocked}
                                 data-testid="input-issue-date"
                             />
@@ -757,8 +786,8 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
                             <Input
                                 id="expiryDate"
                                 type="date"
-                                value={expiryDate}
-                                onChange={(e) => setExpiryDate(e.target.value)}
+                                value={draft.expiryDate}
+                                onChange={(e) => updateDraft({ expiryDate: e.target.value })}
                                 disabled={isActionLocked}
                                 data-testid="input-expiry-date"
                             />
@@ -768,8 +797,8 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
                             <Label htmlFor="issuerName">Issuer / Organization Name *</Label>
                             <Input
                                 id="issuerName"
-                                value={issuerName}
-                                onChange={(e) => setIssuerName(e.target.value)}
+                                value={draft.issuerName}
+                                onChange={(e) => updateDraft({ issuerName: e.target.value })}
                                 disabled={isActionLocked}
                                 placeholder="Your organization name"
                                 data-testid="input-issuer-name"
@@ -780,8 +809,8 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
                             <Label htmlFor="issuerWallet">Issuer Wallet *</Label>
                             <Input
                                 id="issuerWallet"
-                                value={issuerWallet}
-                                onChange={(e) => setIssuerWallet(e.target.value)}
+                                value={draft.issuerWallet}
+                                onChange={(e) => updateDraft({ issuerWallet: e.target.value })}
                                 disabled={isActionLocked}
                                 placeholder="0x..."
                                 data-testid="input-issuer-wallet"
@@ -792,8 +821,8 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
                             <Label htmlFor="certificateId">Certificate ID (auto-generated if empty)</Label>
                             <Input
                                 id="certificateId"
-                                value={certificateId}
-                                onChange={(e) => setCertificateId(e.target.value)}
+                                value={draft.certificateId}
+                                onChange={(e) => updateDraft({ certificateId: e.target.value })}
                                 disabled={isActionLocked}
                                 placeholder="Leave empty to auto-generate"
                                 data-testid="input-certificate-id"
@@ -803,7 +832,7 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
                         <div className="space-y-3 pt-4">
                             <Button
                                 onClick={handleGenerateCertificate}
-                                disabled={isActionLocked || !recipientName || !eventName || !issuerName || !studentId || !issuerWallet || !expiryDate}
+                                disabled={isActionLocked || !draft.recipientName || !draft.eventName || !draft.issuerName || !draft.studentId || !draft.issuerWallet || !draft.expiryDate}
                                 className="w-full"
                                 data-testid="button-generate-certificate"
                             >
@@ -874,7 +903,7 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
                                                 type="button" 
                                                 variant="outline" 
                                                 onClick={clearSignature} 
-                                                disabled={isActionLocked || !signatureDataUrl}
+                                                disabled={isActionLocked || !draft.signatureDataUrl}
                                                 size="sm"
                                                 data-testid="button-clear-signature"
                                             >
@@ -929,7 +958,7 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
 
                                     <Button
                                         onClick={handleProceedToSign}
-                                        disabled={isActionLocked || !signatureDataUrl || isSigningInProgress}
+                                        disabled={isActionLocked || !draft.signatureDataUrl || isSigningInProgress}
                                         className="w-full"
                                         data-testid="button-proceed-to-sign"
                                     >
@@ -977,16 +1006,16 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
                             <div style={{ transform: "scale(0.5)", transformOrigin: "top left", width: "400px", height: "300px" }}>
                                 <CertificateTemplate
                                     data={{
-                                        name: recipientName,
-                                        email: recipientEmail,
-                                        studentId,
-                                        course: eventName,
-                                        issuer: issuerName,
-                                        date: issueDate ? new Date(issueDate).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) : "",
-                                        certificateId: certificateId || "CERT-XXXX-XXXX",
+                                        name: draft.recipientName,
+                                        email: draft.recipientEmail,
+                                        studentId: draft.studentId,
+                                        course: draft.eventName,
+                                        issuer: draft.issuerName,
+                                        date: draft.issueDate ? new Date(draft.issueDate).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) : "",
+                                        certificateId: draft.certificateId || "CERT-XXXX-XXXX",
                                         network: "Sepolia",
-                                        qrCode: qrCodeDataUrl || undefined,
-                                        signature: signatureDataUrl || undefined,
+                                        qrCode: draft.qrCodeDataUrl || undefined,
+                                        signature: draft.signatureDataUrl || undefined,
                                     }}
                                 />
                             </div>
@@ -996,16 +1025,16 @@ export default function CertificateForm({ issuerId, onCertificateCreated }: Cert
                             <CertificateTemplate
                                 ref={certificateRef}
                                 data={{
-                                    name: recipientName,
-                                    email: recipientEmail,
-                                    studentId,
-                                    course: eventName,
-                                    issuer: issuerName,
-                                    date: issueDate ? new Date(issueDate).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) : "",
-                                    certificateId: certificateId || "CERT-XXXX-XXXX",
+                                    name: draft.recipientName,
+                                    email: draft.recipientEmail,
+                                    studentId: draft.studentId,
+                                    course: draft.eventName,
+                                    issuer: draft.issuerName,
+                                    date: draft.issueDate ? new Date(draft.issueDate).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) : "",
+                                    certificateId: draft.certificateId || "CERT-XXXX-XXXX",
                                     network: "Sepolia",
-                                    qrCode: qrCodeDataUrl || undefined,
-                                    signature: signatureDataUrl || undefined,
+                                    qrCode: draft.qrCodeDataUrl || undefined,
+                                    signature: draft.signatureDataUrl || undefined,
                                 }}
                             />
                         </div>

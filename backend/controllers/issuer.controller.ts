@@ -5,9 +5,15 @@ import { merkleService } from "../services/merkle";
 import { blockchainService } from "../services/blockchain";
 import { asyncHandler, NotFoundError, UnauthorizedError, BadRequestError } from "../middleware/error-handler";
 import type { AuthRequest } from "../middleware/auth";
+import { normalizeIssuer } from "../services/issuer-utils";
+import { createLogger } from "../services/logger";
 import Papa from "papaparse";
 import keccak256 from "keccak256";
 import type { CreateCertificateBatchBody, CreateCertificateBody, UploadBody } from "../middleware/validation";
+
+// Track all blockchain retry timers to enable cleanup on shutdown
+const blockchainRetryTimers = new Map<string, NodeJS.Timeout[]>();
+const logger = createLogger("issuer-controller");
 
 function requireIssuerOwnership(userId: string | undefined, issuerId: string): void {
     if (!userId || userId !== issuerId) {
@@ -22,32 +28,75 @@ function scheduleBlockchainRetry(params: {
     documentHash: string;
 }) {
     const retryDelaysMs = [30_000, 120_000, 300_000];
+    // Avoid duplicated retry chains for the same batch.
+    clearBlockchainRetryTimers(params.batchId);
 
-    retryDelaysMs.forEach((delayMs, index) => {
-        setTimeout(async () => {
+    const timers: NodeJS.Timeout[] = [];
+    blockchainRetryTimers.set(params.batchId, timers);
+
+    const scheduleAttempt = (index: number) => {
+        if (index >= retryDelaysMs.length) {
+            clearBlockchainRetryTimers(params.batchId);
+            return;
+        }
+
+        const delayMs = retryDelaysMs[index];
+        const timer = setTimeout(async () => {
             try {
                 const tx = await blockchainService.issueDocument(params.documentHash);
-                if (tx.status !== "confirmed") {
+                if (tx.status === "confirmed") {
+                    await storage.updateDocumentBatch(params.batchId, {
+                        blockchainTxHash: tx.hash || null,
+                        blockNumber: String(tx.blockNumber || 0),
+                        status: "completed",
+                    });
+
+                    await storage.updateCertificate(params.certificateRecordId, {
+                        blockchainStatus: "CONFIRMED",
+                        txHash: tx.hash,
+                    });
+
+                    logger.info("Blockchain confirmation successful for certificate", {
+                        documentId: params.documentId,
+                        batchId: params.batchId,
+                        attempt: index + 1,
+                    });
+
+                    clearBlockchainRetryTimers(params.batchId);
                     return;
                 }
 
-                await storage.updateDocumentBatch(params.batchId, {
-                    blockchainTxHash: tx.hash || null,
-                    blockNumber: String(tx.blockNumber || 0),
-                    status: "completed",
-                });
-
-                await storage.updateCertificate(params.certificateRecordId, {
-                    blockchainStatus: "CONFIRMED",
-                    txHash: tx.hash,
-                });
-
-                console.log(`[BlockchainRetry] Certificate ${params.documentId} confirmed on attempt ${index + 1}`);
+                scheduleAttempt(index + 1);
             } catch (error) {
-                // Retry sequence is best-effort by design.
+                logger.warn("Blockchain retry attempt failed", {
+                    documentId: params.documentId,
+                    batchId: params.batchId,
+                    attempt: index + 1,
+                    error: error instanceof Error ? error.message : "Unknown error",
+                });
+                scheduleAttempt(index + 1);
             }
         }, delayMs);
-    });
+
+        timers.push(timer);
+    };
+
+    scheduleAttempt(0);
+}
+
+// Export for cleanup on server shutdown
+export function clearBlockchainRetryTimers(batchId?: string): void {
+    if (batchId) {
+        const timers = blockchainRetryTimers.get(batchId);
+        if (timers) {
+            timers.forEach(clearTimeout);
+            blockchainRetryTimers.delete(batchId);
+        }
+    } else {
+        // Clear all timers
+        blockchainRetryTimers.forEach((timers) => timers.forEach(clearTimeout));
+        blockchainRetryTimers.clear();
+    }
 }
 
 // Upload and process CSV documents
@@ -106,22 +155,30 @@ export const uploadDocuments = asyncHandler(async (req: AuthRequest, res: Respon
         status: "processing",
     });
 
-    // Store individual documents
-    const documents = await Promise.all(
-        processedDocuments.map(doc =>
-            storage.createDocument({
-                batchId: batch.id,
-                certificateId: typeof doc.originalData?.certificateId === "string" ? doc.originalData.certificateId : null,
-                name: typeof doc.originalData?.name === "string" ? doc.originalData.name : null,
-                course: typeof doc.originalData?.course === "string" ? doc.originalData.course : null,
-                issuer: typeof doc.originalData?.issuer === "string" ? doc.originalData.issuer : null,
-                issuedDate: typeof doc.originalData?.date === "string" ? doc.originalData.date : null,
-                documentHash: doc.hash,
-                digitalSignature: doc.signature,
-                originalData: doc.originalData,
-            })
-        )
-    );
+    // OPTIMIZATION: Process document inserts in chunks instead of all at once
+    // This prevents overwhelming the database connection pool with large CSV imports
+    const CHUNK_SIZE = 100;
+    const documents: any[] = [];
+    
+    for (let i = 0; i < processedDocuments.length; i += CHUNK_SIZE) {
+        const chunk = processedDocuments.slice(i, i + CHUNK_SIZE);
+        const chunkResults = await Promise.all(
+            chunk.map(doc =>
+                storage.createDocument({
+                    batchId: batch.id,
+                    certificateId: typeof doc.originalData?.certificateId === "string" ? doc.originalData.certificateId : null,
+                    name: typeof doc.originalData?.name === "string" ? doc.originalData.name : null,
+                    course: typeof doc.originalData?.course === "string" ? doc.originalData.course : null,
+                    issuer: typeof doc.originalData?.issuer === "string" ? doc.originalData.issuer : null,
+                    issuedDate: typeof doc.originalData?.date === "string" ? doc.originalData.date : null,
+                    documentHash: doc.hash,
+                    digitalSignature: doc.signature,
+                    originalData: doc.originalData,
+                })
+            )
+        );
+        documents.push(...chunkResults);
+    }
 
     // Group documents and create Merkle trees
     const documentGroups = merkleService.groupDocuments(
@@ -188,12 +245,25 @@ export const uploadDocuments = asyncHandler(async (req: AuthRequest, res: Respon
     });
 });
 
-// Get issuer batches
+// Get issuer batches (with pagination)
 export const getBatches = asyncHandler(async (req: AuthRequest, res: Response) => {
     const { issuerId } = req.params;
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize as string) || 20)); // Max 100 per page
+    const offset = (page - 1) * pageSize;
+
     requireIssuerOwnership(req.user?.userId, issuerId);
-    const batches = await storage.getDocumentBatchesByIssuer(issuerId);
-    res.json(batches);
+    const { batches, total } = await storage.getDocumentBatchesByIssuer(issuerId, pageSize, offset);
+    
+    res.json({
+        batches,
+        pagination: {
+            page,
+            pageSize,
+            total,
+            totalPages: Math.ceil(total / pageSize),
+        },
+    });
 });
 
 // Delete a batch
@@ -208,6 +278,9 @@ export const deleteBatch = asyncHandler(async (req: AuthRequest, res: Response) 
     if (batch.issuerId !== issuerId) {
         throw new UnauthorizedError("You are not authorized to delete this batch");
     }
+
+    // Clear any pending blockchain retry timers for this batch
+    clearBlockchainRetryTimers(batchId);
 
     const deleted = await storage.deleteDocumentBatch(batchId);
     if (!deleted) {
@@ -256,7 +329,11 @@ export const deleteDocument = asyncHandler(async (req: AuthRequest, res: Respons
     await storage.updateCertificate(certificate.id, { status: "DELETED" });
     await storage.updateDocument(documentId, { revoked: true, revokedAt: now });
 
-    console.log(`[Delete] Soft-deleted certificate ${certificate.certificateId} (${documentId}) by ${req.user?.email}`);
+    logger.info("Certificate soft-deleted", {
+        certificateId: certificate.certificateId,
+        documentId,
+        deletedBy: req.user?.email,
+    });
 
     return res.json({
         success: true,
@@ -281,15 +358,8 @@ export const createCertificate = asyncHandler(async (req: AuthRequest, res: Resp
         verification,
     } = req.body as CreateCertificateBody;
 
-    const issuerValue: unknown = issuer as unknown;
-    const normalizedIssuer =
-        typeof issuerValue === "string"
-            ? issuerValue.trim()
-            : (typeof (issuerValue as { name?: unknown; issuerName?: unknown })?.name === "string"
-                ? String((issuerValue as { name?: string }).name).trim()
-                : String((issuerValue as { issuerName?: string })?.issuerName || "").trim());
-
-    if (typeof normalizedIssuer !== "string" || normalizedIssuer.length === 0) {
+    const normalizedIssuer = normalizeIssuer(issuer);
+    if (!normalizedIssuer) {
         throw new BadRequestError("Invalid issuer format");
     }
 

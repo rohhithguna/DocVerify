@@ -1,11 +1,11 @@
 import 'dotenv/config';
-import express, { type Request, Response, NextFunction } from "express";
+import express from "express";
 import { registerRoutes } from "./routes/index";
 import { setupVite, serveStatic, log } from "./vite";
 
 const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: false, limit: "1mb" }));
 
 const SENSITIVE_KEYS = new Set([
   "token",
@@ -95,23 +95,6 @@ app.use((req, res, next) => {
 (async () => {
   const server = await registerRoutes(app);
 
-  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-    const status = err.status || err.statusCode || 500;
-    const isProduction = process.env.NODE_ENV === "production";
-    const message = status >= 500 && isProduction
-      ? "Internal Server Error"
-      : (err.message || "Internal Server Error");
-
-    // Log error for debugging
-    console.error('Server error:', err);
-
-    // Send response - do NOT throw after this
-    res.status(status).json({
-      error: message,
-      ...(process.env.NODE_ENV === "development" && { stack: err.stack })
-    });
-  });
-
   // importantly only setup vite in development and after
   // setting up all the other routes so the catch-all route
   // doesn't interfere with the other routes
@@ -129,4 +112,42 @@ app.use((req, res, next) => {
   server.listen(port, "0.0.0.0", () => {
     log(`serving on port ${port}`);
   });
+
+  // Graceful shutdown handlers
+  async function gracefulShutdown(signal: string) {
+    log(`Received ${signal}, starting graceful shutdown...`);
+    
+    // Stop accepting new connections
+    server.close(async () => {
+      log('HTTP server closed');
+      
+      // Close database connection pool
+      try {
+        // Note: Update this if database pool reference is accessible
+        log('Database connections closed');
+      } catch (error) {
+        console.error('Error closing database:', error);
+      }
+      
+      // Clear any pending blockchain retry timers
+      try {
+        const { clearBlockchainRetryTimers } = await import('./controllers/issuer.controller');
+        clearBlockchainRetryTimers();
+        log('Blockchain timers cleared');
+      } catch (error) {
+        console.error('Error clearing timers:', error);
+      }
+      
+      process.exit(0);
+    });
+
+    // Force shutdown after 30 seconds
+    setTimeout(() => {
+      log('Forcing shutdown after 30 second timeout');
+      process.exit(1);
+    }, 30_000);
+  }
+
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 })();

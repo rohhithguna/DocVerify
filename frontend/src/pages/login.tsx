@@ -10,7 +10,7 @@ import { useToast } from "@/hooks/use-toast";
 
 export default function LoginPage() {
   const navigate = useNavigate();
-  const { login } = useAuth();
+  const { login, register } = useAuth();
   const [isLogin, setIsLogin] = useState(true);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -24,7 +24,6 @@ export default function LoginPage() {
   const [organization, setOrganization] = useState("");
   const { toast } = useToast();
 
-  const { register } = useAuth();
   const isInfoMessage = error.toLowerCase().includes("successful");
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -188,7 +187,7 @@ export default function LoginPage() {
                   onChange={(e) => setPassword(e.target.value)}
                   disabled={loading}
                   required
-                  minLength={6}
+                  minLength={8}
                 />
               </div>
 
@@ -209,7 +208,7 @@ export default function LoginPage() {
             {/* Demo Info */}
             <div className="mt-6 pt-4 border-t border-border">
               <p className="text-xs text-muted-foreground text-center">
-                For demo: Register with any email and password (min 6 chars)
+                For demo: Register with any email and password (min 8 chars)
               </p>
             </div>
           </CardContent>

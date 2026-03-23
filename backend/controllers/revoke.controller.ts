@@ -3,6 +3,9 @@ import { storage } from "../storage";
 import { blockchainService } from "../services/blockchain";
 import { asyncHandler, NotFoundError, BadRequestError } from "../middleware/error-handler";
 import type { AuthRequest } from "../middleware/auth";
+import { createLogger } from "../services/logger";
+
+const logger = createLogger("revoke-controller");
 
 /**
  * POST /api/issuer/revoke
@@ -46,14 +49,32 @@ export const revokeDocument = asyncHandler(async (req: AuthRequest, res: Respons
     );
   }
 
-  // Call smart contract to revoke
+  // Call smart contract to revoke with retry logic
   let blockchainTx = null;
-  try {
-    blockchainTx = await blockchainService.revokeDocument(batch.merkleRoot);
-  } catch (error: any) {
-    console.error("[Revoke] Blockchain revocation failed:", error);
+  const MAX_RETRIES = 3;
+  let lastError: any = null;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      blockchainTx = await blockchainService.revokeDocument(batch.merkleRoot);
+      break; // Success - exit retry loop
+    } catch (error: any) {
+      lastError = error;
+      if (attempt < MAX_RETRIES - 1) {
+        const delayMs = Math.pow(2, attempt) * 1000; // Exponential backoff: 1s, 2s, 4s
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+
+  if (!blockchainTx) {
+    logger.error("Blockchain revocation failed after retries", {
+      batchId,
+      revokedBy: req.user?.email,
+      error: lastError?.message || "Unknown blockchain error",
+    });
     return res.status(500).json({
-      error: "Blockchain revocation failed",
+      error: "Blockchain revocation failed after retries",
     });
   }
 
@@ -77,7 +98,12 @@ export const revokeDocument = asyncHandler(async (req: AuthRequest, res: Respons
 
   const updatedBatch = await storage.getDocumentBatch(batchId);
 
-  console.log(`[Revoke] ✅ Batch ${batchId} revoked by ${req.user?.email}`);
+  logger.info("Batch revoked successfully", {
+    batchId,
+    revokedBy: req.user?.email,
+    documentCount: docsInBatch.length,
+    txHash: blockchainTx?.hash,
+  });
 
   res.json({
     success: true,

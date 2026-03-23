@@ -11,7 +11,7 @@ import * as blockchainController from "../controllers/blockchain.controller";
 
 // Middleware
 import { errorHandler, notFoundHandler } from "../middleware/error-handler";
-import { requireAuth } from "../middleware/auth";
+import { requireAuth, requireTrustedOriginForMutations } from "../middleware/auth";
 import {
   generalLimiter,
   uploadLimiter,
@@ -43,6 +43,7 @@ const upload = multer({
 export async function registerRoutes(app: Express): Promise<Server> {
   // Apply general rate limiting to all API routes
   app.use("/api/", generalLimiter);
+  app.use("/api/", requireTrustedOriginForMutations);
 
   // ============================================
   // Auth Routes (public)

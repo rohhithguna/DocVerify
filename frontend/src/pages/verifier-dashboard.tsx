@@ -5,12 +5,23 @@ import type { VerificationWithDetails } from "@shared/schema";
 import FileUpload from "@/components/file-upload";
 
 type ActiveView = "verify" | "dashboard";
+const DEMO_VERIFIER_ID = "demo-verifier";
+
+type VerificationHistoryResponse = {
+  verifications: VerificationWithDetails[];
+  pagination: {
+    page: number;
+    pageSize: number;
+    total: number;
+    totalPages: number;
+  };
+};
 
 export default function VerifierDashboard() {
   const navigate = useNavigate();
   const routeLocation = useLocation();
   const params = useParams();
-  const verifierId = params.verifierId as string;
+  const verifierId = params.verifierId || DEMO_VERIFIER_ID;
 
   // Allow deep-linking to dashboard via location.state
   const initialView: ActiveView =
@@ -20,6 +31,7 @@ export default function VerifierDashboard() {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [scanPhase, setScanPhase] = useState<"idle" | "scanning" | "complete">("idle");
   const [scanFileName, setScanFileName] = useState("");
+  const [lastVerification, setLastVerification] = useState<any>(null);
   const pendingVerification = useRef<any>(null);
 
   // Keep view in sync if state changes
@@ -35,18 +47,18 @@ export default function VerifierDashboard() {
     recentCount: number;
   }>({
     queryKey: ['/api/verifier', verifierId, 'stats'],
-    enabled: !!verifierId,
   });
 
   // Fetch verification history
-  const { data: history, refetch: refetchHistory } = useQuery<VerificationWithDetails[]>({
+  const { data: historyResponse, refetch: refetchHistory } = useQuery<VerificationHistoryResponse>({
     queryKey: ['/api/verifier', verifierId, 'history'],
-    enabled: !!verifierId,
   });
+  const history = historyResponse?.verifications || [];
 
   /* ─── Scanning Flow ─── */
   const handleVerificationComplete = useCallback((verification: any) => {
     pendingVerification.current = verification;
+    setLastVerification(verification);
     // Show scanning animation for 2 seconds, then navigate
     setScanPhase("scanning");
     setTimeout(() => {
@@ -104,7 +116,11 @@ export default function VerifierDashboard() {
           Verify
         </button>
         <button
-          onClick={() => navigate("/results")}
+          onClick={() => {
+            if (!lastVerification) return;
+            navigate("/results", { state: { verification: lastVerification } });
+          }}
+          disabled={!lastVerification}
           data-testid="nav-results"
         >
           Results

@@ -4,6 +4,7 @@ import { cryptoService } from "../services/crypto";
 import { merkleService } from "../services/merkle";
 import { blockchainService } from "../services/blockchain";
 import { asyncHandler, AppError, BadRequestError } from "../middleware/error-handler";
+import { normalizeIssuer } from "../services/issuer-utils";
 import jsQR from "jsqr";
 import { PNG } from "pngjs";
 import jpeg from "jpeg-js";
@@ -17,6 +18,66 @@ type CertificateMetadata = {
     date: string;
     certificateId: string;
 };
+
+function pickFirstNonEmpty(...values: Array<unknown>): string {
+    for (const value of values) {
+        if (typeof value === "string" && value.trim()) {
+            return value.trim();
+        }
+    }
+    return "";
+}
+
+function buildCertificateMetadataFromStoredRecords(
+    certificateId: string,
+    matchedDocument: any,
+    matchedCertificate: any,
+): CertificateMetadata | null {
+    const originalData =
+        matchedDocument?.originalData && typeof matchedDocument.originalData === "object"
+            ? (matchedDocument.originalData as Record<string, unknown>)
+            : {};
+
+    const name = pickFirstNonEmpty(
+        matchedDocument?.name,
+        originalData.name,
+        matchedCertificate?.holderName,
+    );
+    const course = pickFirstNonEmpty(
+        matchedDocument?.course,
+        originalData.course,
+        matchedCertificate?.course,
+    );
+    const issuer = pickFirstNonEmpty(
+        matchedDocument?.issuer,
+        originalData.issuer,
+        matchedCertificate?.issuerName,
+    );
+    const date = pickFirstNonEmpty(
+        matchedDocument?.date,
+        matchedDocument?.issuedDate,
+        originalData.date,
+        matchedCertificate?.issueDate instanceof Date
+            ? matchedCertificate.issueDate.toISOString()
+            : matchedCertificate?.issueDate,
+    );
+
+    if (!name || !course || !issuer || !date) {
+        return null;
+    }
+
+    return {
+        name,
+        course,
+        issuer,
+        date,
+        certificateId: pickFirstNonEmpty(
+            matchedDocument?.certificateId,
+            matchedCertificate?.certificateId,
+            certificateId,
+        ),
+    };
+}
 
 function decodeQrDataFromImage(fileBuffer: Buffer, mimeType?: string): string {
     let imageData: Uint8ClampedArray;
@@ -79,7 +140,7 @@ async function resolveCertificateMetadataFromQrData(qrData: string): Promise<Cer
         parsed = null;
     }
 
-    if (parsed) {
+    if (parsed && typeof parsed === 'object') {
         const certificateData = cryptoService.buildCanonicalCertificateData(parsed as Record<string, any>);
         if (!certificateData.name || !certificateData.course || !certificateData.issuer || !certificateData.date || !certificateData.certificateId) {
             throw new BadRequestError("QR metadata is missing required certificate fields");
@@ -87,31 +148,15 @@ async function resolveCertificateMetadataFromQrData(qrData: string): Promise<Cer
         return certificateData;
     }
 
+    // Only allow valid verify URL format, reject plain strings
     const certificateIdFromUrl = extractCertificateIdFromVerifyUrl(qrData);
     if (!certificateIdFromUrl) {
-        throw new BadRequestError("Invalid QR payload format");
+        throw new BadRequestError("QR code must contain valid certificate metadata or verification URL");
     }
 
-    const normalizedCertificateId = certificateIdFromUrl.toUpperCase();
-    const matchedDocument =
-        await storage.getDocumentByCertificateId(certificateIdFromUrl) ||
-        await storage.getDocumentByCertificateId(normalizedCertificateId);
-
-    if (!matchedDocument) {
-        throw new BadRequestError("Certificate not found in system");
-    }
-
-    const metadata = cryptoService.buildCanonicalCertificateData(matchedDocument.originalData as Record<string, any>);
-    if (!metadata.name || !metadata.course || !metadata.issuer || !metadata.date || !metadata.certificateId) {
-        throw new BadRequestError("Certificate metadata is incomplete");
-    }
-
-    const certificateData = {
-        ...metadata,
-        certificateId: normalizedCertificateId,
-    };
-
-    return certificateData;
+    // SECURITY: Do NOT fall back to database lookup by certificateId
+    // User must provide properly encoded QR data, not arbitrary string
+    throw new BadRequestError("Invalid QR format: certificate metadata is required");
 }
 
 function hasRequiredCertificateData(data: { name: string; course: string; issuer: string; date: string; certificateId: string }): boolean {
@@ -123,12 +168,8 @@ async function performVerification(
     sourceLabel: string,
     certificateData: { name: string; course: string; issuer: string; date: string; certificateId: string },
 ) {
-    const normalizedIssuer =
-        typeof certificateData.issuer === "string"
-            ? certificateData.issuer.trim()
-            : "";
-
-    if (typeof normalizedIssuer !== "string" || normalizedIssuer.length === 0) {
+    const normalizedIssuer = normalizeIssuer(certificateData.issuer);
+    if (!normalizedIssuer) {
         throw new BadRequestError("Invalid issuer format");
     }
 
@@ -148,8 +189,9 @@ async function performVerification(
         verificationData: canonicalCertificateData,
     });
 
-    const matchedDocument = await storage.getDocumentByCertificateId(canonicalCertificateData.certificateId);
-    const matchedCertificate = await storage.getCertificateByCertificateId(canonicalCertificateData.certificateId);
+    // OPTIMIZATION: Combine two queries into one parallel fetch
+    const { document: matchedDocument, certificate: matchedCertificate } = 
+        await storage.getDocumentAndCertificateByCertificateId(canonicalCertificateData.certificateId);
 
     const issueHash = matchedDocument?.documentHash ?? null;
     const hashMatched = issueHash === verifyHash;
@@ -287,13 +329,39 @@ async function performVerification(
         }
     }
 
-    const directHashBlockchain = await blockchainService.verifyDocument(verifyHash);
-    const blockchainRootExists = proofRoot
-        ? await blockchainService.rootExists(proofRoot)
-        : false;
-    const merkleRootBlockchain = proofRoot
-        ? await blockchainService.verifyMerkleRoot(proofRoot)
-        : blockchainResult;
+    // OPTIMIZATION: Parallelize blockchain verification calls with timeouts
+    // Instead of sequential Promise.race calls, run all in parallel for better latency
+    const blockchainTimeoutMs = 3000;
+
+    const [directHashResult, rootExistsResult, merkleRootResult] = await Promise.all([
+        // Direct hash verification with timeout
+        Promise.race([
+            blockchainService.verifyDocument(verifyHash),
+            new Promise<typeof blockchainResult>((_, reject) => 
+                setTimeout(() => reject(new Error("timeout")), blockchainTimeoutMs)
+            ),
+        ]).catch(() => blockchainResult),
+
+        // Root exists check with timeout
+        (proofRoot ? Promise.race([
+            blockchainService.rootExists(proofRoot),
+            new Promise<boolean>((_, reject) => 
+                setTimeout(() => reject(new Error("timeout")), blockchainTimeoutMs)
+            ),
+        ]) : Promise.resolve(false)).catch(() => false),
+
+        // Merkle root verification with timeout
+        (proofRoot ? Promise.race([
+            blockchainService.verifyMerkleRoot(proofRoot),
+            new Promise<typeof blockchainResult>((_, reject) => 
+                setTimeout(() => reject(new Error("timeout")), blockchainTimeoutMs)
+            ),
+        ]) : Promise.resolve(blockchainResult)).catch(() => blockchainResult),
+    ]);
+
+    const directHashBlockchain = directHashResult as typeof blockchainResult;
+    const blockchainRootExists = rootExistsResult as boolean;
+    const merkleRootBlockchain = merkleRootResult as typeof blockchainResult;
 
     // Prefer direct hash verification (Stage-6); keep Merkle-root fallback for older batches.
     blockchainResult = directHashBlockchain.exists ? directHashBlockchain : merkleRootBlockchain;
@@ -418,13 +486,20 @@ export const verifyDocument = asyncHandler(async (req: Request, res: Response) =
     const qrData = decodeQrDataFromImage(req.file.buffer, req.file.mimetype);
 
     const certificateIdFromUrl = extractCertificateIdFromVerifyUrl(qrData);
+    let matchedDocument: any = null;
+    let matchedCertificate: any = null;
+
     if (certificateIdFromUrl) {
         const normalizedCertificateId = certificateIdFromUrl.toUpperCase();
-        const matchedDocument =
-            await storage.getDocumentByCertificateId(certificateIdFromUrl) ||
-            await storage.getDocumentByCertificateId(normalizedCertificateId);
+        const [rawMatch, normalizedMatch] = await Promise.all([
+            storage.getDocumentAndCertificateByCertificateId(certificateIdFromUrl),
+            storage.getDocumentAndCertificateByCertificateId(normalizedCertificateId),
+        ]);
 
-        if (!matchedDocument) {
+        matchedDocument = rawMatch.document || normalizedMatch.document;
+        matchedCertificate = rawMatch.certificate || normalizedMatch.certificate;
+
+        if (!matchedDocument && !matchedCertificate) {
             return res.json({
                 success: true,
                 status: "NOT_FOUND",
@@ -444,7 +519,22 @@ export const verifyDocument = asyncHandler(async (req: Request, res: Response) =
         }
     }
 
-    const certificateData = await resolveCertificateMetadataFromQrData(qrData);
+    let certificateData: CertificateMetadata;
+    if (certificateIdFromUrl && matchedDocument && matchedCertificate) {
+        const reconstructedMetadata = buildCertificateMetadataFromStoredRecords(
+            certificateIdFromUrl,
+            matchedDocument,
+            matchedCertificate,
+        );
+
+        if (reconstructedMetadata) {
+            certificateData = reconstructedMetadata;
+        } else {
+            certificateData = await resolveCertificateMetadataFromQrData(qrData);
+        }
+    } else {
+        certificateData = await resolveCertificateMetadataFromQrData(qrData);
+    }
 
     const response = await performVerification(verifierId, req.file.originalname, certificateData);
     res.json(response);
@@ -515,11 +605,24 @@ export const verifyMetadata = asyncHandler(async (req: Request, res: Response) =
     res.json(response);
 });
 
-// Get verifier history
+// Get verifier history (with pagination)
 export const getHistory = asyncHandler(async (req: Request, res: Response) => {
     const { verifierId } = req.params;
-    const verifications = await storage.getVerificationsByVerifier(verifierId);
-    res.json(verifications);
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize as string) || 20)); // Max 100 per page
+    const offset = (page - 1) * pageSize;
+
+    const { verifications, total } = await storage.getVerificationsByVerifier(verifierId, pageSize, offset);
+    
+    res.json({
+        verifications,
+        pagination: {
+            page,
+            pageSize,
+            total,
+            totalPages: Math.ceil(total / pageSize),
+        },
+    });
 });
 
 // Get verifier statistics

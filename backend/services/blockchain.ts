@@ -3,9 +3,18 @@ import { DOCUTRUST_ABI } from "./docutrust-abi";
 
 export interface BlockchainConfig {
   rpcUrl: string;
-  privateKey: string;
+  privateKey: string; // Must be loaded via secure loader, never logged
   contractAddress: string;
   networkName: string;
+}
+
+// Secure blockchain key loader - prevents keys from exposure in logs
+function loadBlockchainPrivateKey(): string {
+  const key = process.env.BLOCKCHAIN_PRIVATE_KEY;
+  if (!key || key.length === 0) {
+    throw new Error('Missing blockchain credentials');
+  }
+  return key;
 }
 
 export interface BlockchainTransaction {
@@ -44,14 +53,18 @@ export class BlockchainService {
   private mockMode: boolean;
 
   constructor(config: BlockchainConfig, options?: { blockchainRequired?: boolean; testMode?: boolean; mockMode?: boolean }) {
-    this.config = config;
-    this.blockchainRequired = options?.blockchainRequired ?? false;
-    this.testMode = options?.testMode ?? false;
-    this.mockMode = options?.mockMode ?? false;
-    this.provider = new ethers.JsonRpcProvider(config.rpcUrl, undefined, { staticNetwork: true });
-    const signer = new ethers.Wallet(config.privateKey, this.provider);
-    this.wallet = new ethers.NonceManager(signer);
-    this.contract = new ethers.Contract(config.contractAddress, DOCUTRUST_ABI, this.wallet);
+    try {
+      this.config = config;
+      this.blockchainRequired = options?.blockchainRequired ?? false;
+      this.testMode = options?.testMode ?? false;
+      this.mockMode = options?.mockMode ?? false;
+      this.provider = new ethers.JsonRpcProvider(config.rpcUrl, undefined, { staticNetwork: true });
+      const signer = new ethers.Wallet(config.privateKey, this.provider);
+      this.wallet = new ethers.NonceManager(signer);
+      this.contract = new ethers.Contract(config.contractAddress, DOCUTRUST_ABI, this.wallet);
+    } catch (error) {
+      throw new Error('Failed to initialize blockchain service');
+    }
   }
 
   private mockTransaction(status: "pending" | "confirmed" | "failed" = "confirmed"): BlockchainTransaction {
@@ -284,6 +297,17 @@ export class BlockchainService {
   }
 
   public async getNetworkStatus(): Promise<BlockchainNetworkStatus> {
+    if (this.testMode || this.mockMode) {
+      return {
+        blockHeight: 42000,
+        gasPrice: "2.1",
+        isConnected: true,
+        status: "CONNECTED",
+        contractAddress: this.config.contractAddress,
+        totalDocuments: 1337,
+      };
+    }
+
     const isConnected = await this.checkConnection();
 
     if (!isConnected) {

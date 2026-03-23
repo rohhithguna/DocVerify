@@ -33,7 +33,7 @@ export interface IStorage {
   // Document Batches
   createDocumentBatch(batch: InsertDocumentBatch): Promise<DocumentBatch>;
   getDocumentBatch(id: string): Promise<DocumentBatch | undefined>;
-  getDocumentBatchesByIssuer(issuerId: string): Promise<DocumentBatchWithStats[]>;
+  getDocumentBatchesByIssuer(issuerId: string, limit?: number, offset?: number): Promise<{ batches: DocumentBatchWithStats[]; total: number }>;
   updateDocumentBatch(id: string, updates: Partial<DocumentBatch>): Promise<DocumentBatch | undefined>;
   getAllDocumentBatches(): Promise<DocumentBatch[]>;
   deleteDocumentBatch(id: string): Promise<boolean>;
@@ -58,7 +58,7 @@ export interface IStorage {
   // Verifications
   createVerification(verification: InsertVerification): Promise<Verification>;
   getVerification(id: string): Promise<Verification | undefined>;
-  getVerificationsByVerifier(verifierId: string): Promise<VerificationWithDetails[]>;
+  getVerificationsByVerifier(verifierId: string, limit?: number, offset?: number): Promise<{ verifications: VerificationWithDetails[]; total: number }>;
   getVerificationsByDocumentId(documentId: string): Promise<Verification[]>;
   deleteVerificationsByDocumentId(documentId: string): Promise<number>;
   updateVerification(id: string, updates: Partial<Verification>): Promise<Verification | undefined>;
@@ -135,76 +135,117 @@ export class DbStorage implements IStorage {
     return batch;
   }
 
-  async getDocumentBatchesByIssuer(issuerId: string): Promise<DocumentBatchWithStats[]> {
-    const batches = await this.db
-      .select()
-      .from(documentBatches)
-      .where(eq(documentBatches.issuerId, issuerId))
-      .orderBy(desc(documentBatches.createdAt));
+  async getDocumentBatchesByIssuer(
+    issuerId: string,
+    limit: number = 20,
+    offset: number = 0
+  ): Promise<{ batches: DocumentBatchWithStats[]; total: number }> {
+    // OPTIMIZATION: Single paginated query instead of fetching all batches
+    const [countResult, batches] = await Promise.all([
+      this.db
+        .select({ count: sql<number>`cast(count(*) as integer)` })
+        .from(documentBatches)
+        .where(eq(documentBatches.issuerId, issuerId)),
+      this.db
+        .select()
+        .from(documentBatches)
+        .where(eq(documentBatches.issuerId, issuerId))
+        .orderBy(desc(documentBatches.createdAt))
+        .limit(limit)
+        .offset(offset),
+    ]);
 
-    // Get verification stats for each batch, counting only ACTIVE certificates when present.
-    const batchesWithStats = await Promise.all(
-      batches.map(async (batch) => {
-        const batchDocuments = await this.db
-          .select({ id: documents.id })
-          .from(documents)
-          .where(eq(documents.batchId, batch.id));
+    const total = countResult[0]?.count || 0;
+    const batchIds = batches.map(b => b.id);
 
-        const documentIds = batchDocuments.map((doc) => doc.id);
+    if (batchIds.length === 0) {
+      return { batches: [], total };
+    }
 
-        if (documentIds.length === 0) {
-          return null;
+    // OPTIMIZATION: Fetch all related data in 3 parallel queries instead of N+3
+    const [allDocuments, allCertificates, allVerifications] = await Promise.all([
+      this.db
+        .select({ id: documents.id, batchId: documents.batchId })
+        .from(documents)
+        .where(inArray(documents.batchId, batchIds)),
+      this.db
+        .select({
+          id: certificates.id,
+          documentId: certificates.documentId,
+          status: certificates.status,
+          blockchainStatus: certificates.blockchainStatus,
+        })
+        .from(certificates)
+        .where(inArray(certificates.documentId, this.db.select({ id: documents.id }).from(documents).where(inArray(documents.batchId, batchIds)))),
+      this.db
+        .select()
+        .from(verifications)
+        .where(inArray(verifications.matchedBatchId, batchIds)),
+    ]);
+
+    // Process in-memory to build results
+    const documentsByBatch = new Map<string, string[]>();
+    const documentToBatchId = new Map<string, string>();
+    allDocuments.forEach(doc => {
+      documentToBatchId.set(doc.id, doc.batchId);
+      if (!documentsByBatch.has(doc.batchId)) {
+        documentsByBatch.set(doc.batchId, []);
+      }
+      documentsByBatch.get(doc.batchId)!.push(doc.id);
+    });
+
+    const verificationsByBatch = new Map<string, typeof allVerifications>();
+    allVerifications.forEach(v => {
+      if (v.matchedBatchId) {
+        if (!verificationsByBatch.has(v.matchedBatchId)) {
+          verificationsByBatch.set(v.matchedBatchId, []);
         }
+        verificationsByBatch.get(v.matchedBatchId)!.push(v);
+      }
+    });
 
-        const batchCertificates = await this.db
-          .select({
-            id: certificates.id,
-            documentId: certificates.documentId,
-            status: certificates.status,
-            blockchainStatus: certificates.blockchainStatus,
-          })
-          .from(certificates)
-          .where(inArray(certificates.documentId, documentIds));
+    const batchesWithStats = batches
+      .map((batch) => {
+        const batchDocIds = documentsByBatch.get(batch.id) || [];
+        if (batchDocIds.length === 0) return null;
 
-        const hasCertificateRows = batchCertificates.length > 0;
+        const batchCerts = allCertificates.filter(
+          (certificate) =>
+            typeof certificate.documentId === "string" &&
+            documentToBatchId.get(certificate.documentId) === batch.id
+        );
+        const hasCertificateRows = batchCerts.length > 0;
         const activeDocumentIds = new Set(
-          batchCertificates
+          batchCerts
             .filter((certificate) => certificate.status === "ACTIVE" && !!certificate.documentId)
             .map((certificate) => certificate.documentId as string)
         );
 
-        // If certificates exist for this batch and none are ACTIVE, hide the batch from issuer list.
         if (hasCertificateRows && activeDocumentIds.size === 0) {
           return null;
         }
 
-        const scopedDocumentIds = hasCertificateRows ? Array.from(activeDocumentIds) : documentIds;
-        const scopedBatchVerifications = scopedDocumentIds.length > 0
-          ? await this.db
-              .select()
-              .from(verifications)
-              .where(inArray(verifications.matchedDocumentId, scopedDocumentIds))
-          : [];
+        const scopedDocumentIds = hasCertificateRows ? Array.from(activeDocumentIds) : batchDocIds;
+        const scopedBatchVerifications = verificationsByBatch.get(batch.id) || [];
 
         const verificationCount = scopedBatchVerifications.length;
         const successfulVerifications = scopedBatchVerifications.filter(v => v.status === 'verified').length;
         const successRate = verificationCount > 0 ? (successfulVerifications / verificationCount) * 100 : 0;
 
-        const result: DocumentBatchWithStats = {
+        return {
           ...batch,
           documentCount: scopedDocumentIds.length,
           verificationCount,
           successRate,
           documentId: scopedDocumentIds[0] as string | undefined,
-          blockchainStatus: batchCertificates.find(
+          blockchainStatus: batchCerts.find(
             (certificate) => certificate.documentId === scopedDocumentIds[0]
           )?.blockchainStatus as "CONFIRMED" | "PENDING" | "FAILED" | undefined,
-        };
-        return result;
+        } as DocumentBatchWithStats;
       })
-    );
+      .filter((batch): batch is DocumentBatchWithStats => batch !== null);
 
-    return batchesWithStats.filter((batch): batch is DocumentBatchWithStats => batch !== null);
+    return { batches: batchesWithStats, total };
   }
 
   async updateDocumentBatch(id: string, updates: Partial<DocumentBatch>): Promise<DocumentBatch | undefined> {
@@ -319,6 +360,17 @@ export class DbStorage implements IStorage {
       .from(documents)
       .where(sql`certificate_id = ${certificateId} OR original_data->>'certificateId' = ${certificateId}`);
     return document;
+  }
+
+  // OPTIMIZATION: Combine document + certificate queries into single fetch
+  async getDocumentAndCertificateByCertificateId(certificateId: string): Promise<
+    { document: Document | undefined; certificate: Certificate | undefined }
+  > {
+    const [document, certificate] = await Promise.all([
+      this.getDocumentByCertificateId(certificateId),
+      this.getCertificateByCertificateId(certificateId),
+    ]);
+    return { document, certificate };
   }
 
   async getDocumentsByBatch(batchId: string): Promise<Document[]> {
@@ -467,8 +519,18 @@ export class DbStorage implements IStorage {
     return verification;
   }
 
-  async getVerificationsByVerifier(verifierId: string): Promise<VerificationWithDetails[]> {
-    const results = await this.db
+  async getVerificationsByVerifier(
+    verifierId: string,
+    limit: number = 20,
+    offset: number = 0
+  ): Promise<{ verifications: VerificationWithDetails[]; total: number }> {
+    // OPTIMIZATION: Single paginated query with proper pagination support
+    const countQuery = await this.db
+      .select({ count: sql<number>`cast(count(*) as integer)` })
+      .from(verifications)
+      .where(eq(verifications.verifierId, verifierId));
+
+    const queryResults = await this.db
       .select({
         verification: verifications,
         batch: documentBatches,
@@ -476,13 +538,18 @@ export class DbStorage implements IStorage {
       .from(verifications)
       .leftJoin(documentBatches, eq(verifications.matchedBatchId, documentBatches.id))
       .where(eq(verifications.verifierId, verifierId))
-      .orderBy(desc(verifications.createdAt));
+      .orderBy(desc(verifications.createdAt))
+      .limit(limit)
+      .offset(offset);
 
-    return results.map(({ verification, batch }) => ({
-      ...verification,
-      batchName: batch?.batchName,
-      issuerName: batch?.issuerName,
+    const total = countQuery[0]?.count || 0;
+    const verificationsList = queryResults.map(({ verification: v, batch: b }) => ({
+      ...v,
+      batchName: b?.batchName,
+      issuerName: b?.issuerName,
     }));
+
+    return { verifications: verificationsList, total };
   }
 
   async getVerificationsByDocumentId(documentId: string): Promise<Verification[]> {

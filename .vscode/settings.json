@@ -1,3 +1,5 @@
 {
-    "chat.tools.terminal.ignoreDefaultAutoApproveRules": true
+    "chat.tools.terminal.ignoreDefaultAutoApproveRules": true,
+    "typescript.tsserver.experimental.enableProjectDiagnostics": false,
+    "javascript.tsserver.experimental.enableProjectDiagnostics": false
 }

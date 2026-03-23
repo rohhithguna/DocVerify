@@ -718,3 +718,10 @@ button, a, input, [role="button"] {
     border-radius: 12px;
   }
 }
+
+@media print {
+  * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+}

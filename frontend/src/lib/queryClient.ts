@@ -1,10 +1,23 @@
 import { QueryClient, QueryFunction } from "@tanstack/react-query";
 
 /**
- * Get the stored JWT token from localStorage.
+ * Get the stored JWT token from sessionStorage.
+ * Falls back to localStorage once for backward compatibility.
  */
 function getToken(): string | null {
-  return localStorage.getItem("docutrust_token");
+  if (typeof window === "undefined") return null;
+  const key = "docutrust_token";
+  const sessionToken = sessionStorage.getItem(key);
+  if (sessionToken) return sessionToken;
+
+  const legacyToken = localStorage.getItem(key);
+  if (legacyToken) {
+    sessionStorage.setItem(key, legacyToken);
+    localStorage.removeItem(key);
+    return legacyToken;
+  }
+
+  return null;
 }
 
 /**
@@ -94,11 +107,12 @@ export const queryClient = new QueryClient({
       queryFn: getQueryFn({ on401: "throw" }),
       refetchInterval: false,
       refetchOnWindowFocus: false,
-      staleTime: Infinity,
-      retry: false,
+      staleTime: 60000,
+      gcTime: 300000,
+      retry: (failureCount) => failureCount < 2,
     },
     mutations: {
-      retry: false,
+      retry: (failureCount) => failureCount < 1,
     },
   },
 });

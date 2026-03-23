@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from "express";
-import { createHmac, randomBytes, pbkdf2Sync } from "crypto";
+import { createHmac, randomBytes, pbkdf2Sync, timingSafeEqual } from "crypto";
 
 // ──────────────────────────────────────────────
 //  Types
@@ -27,18 +27,24 @@ if (!JWT_SECRET_RAW) {
   throw new Error("JWT_SECRET is required and must be provided via environment variables");
 }
 
-if (JWT_SECRET_RAW === "default" || JWT_SECRET_RAW === "docutrust-dev-secret") {
-  throw new Error("JWT_SECRET must not use a default or development value");
+// Strict JWT secret validation - reject any weak or default values
+const forbiddenPatterns = [
+  /^default$/i,
+  /docutrust.*dev|dev.*secret/i,
+  /change.*production|replace.*with/i,
+  /^[a-z]+$/i, // All lowercase letters
+  /^[A-Z]+$/i, // All uppercase letters
+  /^[0-9]+$/, // All digits
+];
+
+if (JWT_SECRET_RAW.length < 32) {
+  throw new Error("JWT_SECRET must be at least 32 characters (use strong random value)");
 }
 
-const normalizedSecret = JWT_SECRET_RAW.toLowerCase();
-if (
-  JWT_SECRET_RAW.length < 32 ||
-  normalizedSecret.includes("change-in-production") ||
-  normalizedSecret.includes("replace-with") ||
-  normalizedSecret.includes("dev-secret")
-) {
-  throw new Error("JWT_SECRET is too weak. Use a strong random value (minimum 32 characters).");
+for (const pattern of forbiddenPatterns) {
+  if (pattern.test(JWT_SECRET_RAW)) {
+    throw new Error("JWT_SECRET contains forbidden pattern - use strong random value");
+  }
 }
 
 const JWT_SECRET: string = JWT_SECRET_RAW;
@@ -53,6 +59,13 @@ function base64urlDecode(str: string): string {
 
 function sign(payload: string, secret: string): string {
   return createHmac("sha256", secret).update(payload).digest("base64url");
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const aBuffer = Buffer.from(a);
+  const bBuffer = Buffer.from(b);
+  if (aBuffer.length !== bBuffer.length) return false;
+  return timingSafeEqual(aBuffer, bBuffer);
 }
 
 /**
@@ -84,7 +97,7 @@ export function verifyToken(token: string): JwtPayload | null {
 
     // Verify signature
     const expectedSignature = sign(`${header}.${payload}`, JWT_SECRET);
-    if (signature !== expectedSignature) return null;
+    if (!safeEqual(signature, expectedSignature)) return null;
 
     // Decode payload
     const decoded = JSON.parse(base64urlDecode(payload));
@@ -128,7 +141,7 @@ export function verifyPassword(password: string, storedHash: string): boolean {
   const [salt, hash] = storedHash.split(":");
   if (!salt || !hash) return false;
   const computed = pbkdf2Sync(password, salt, ITERATIONS, KEY_LENGTH, "sha512").toString("hex");
-  return computed === hash;
+  return safeEqual(computed, hash);
 }
 
 // ──────────────────────────────────────────────
@@ -154,6 +167,51 @@ export function requireAuth(req: AuthRequest, res: Response, next: NextFunction)
   }
 
   req.user = payload;
+  next();
+}
+
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+function parseOriginHost(value: string | undefined): string | null {
+  if (!value) return null;
+  try {
+    return new URL(value).host;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Basic CSRF mitigation for browser-based requests:
+ * - mutating methods must come from same host or configured trusted origin
+ * - non-browser clients without Origin header are allowed
+ */
+export function requireTrustedOriginForMutations(req: Request, res: Response, next: NextFunction) {
+  if (SAFE_METHODS.has(req.method.toUpperCase())) {
+    next();
+    return;
+  }
+
+  const originHost = parseOriginHost(req.headers.origin);
+  if (!originHost) {
+    next();
+    return;
+  }
+
+  const trustedHosts = new Set<string>();
+  if (req.headers.host) trustedHosts.add(req.headers.host);
+
+  const configuredOrigins = [process.env.FRONTEND_ORIGIN, process.env.APP_ORIGIN]
+    .map((value) => parseOriginHost(value))
+    .filter((value): value is string => Boolean(value));
+
+  configuredOrigins.forEach((host) => trustedHosts.add(host));
+
+  if (!trustedHosts.has(originHost)) {
+    res.status(403).json({ error: "Forbidden origin" });
+    return;
+  }
+
   next();
 }
 

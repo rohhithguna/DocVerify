@@ -39,33 +39,123 @@ async function getApiErrorMessage(response: Response, fallbackMessage: string): 
 
 const AuthContext = createContext<AuthContextType | null>(null);
 
+const TOKEN_STORAGE_KEY = "docutrust_token";
+
+let secureToken: string | null = null;
+
+function readTokenFromStorage(): string | null {
+  if (typeof window === "undefined") return null;
+  const sessionToken = window.sessionStorage.getItem(TOKEN_STORAGE_KEY);
+  if (sessionToken) return sessionToken;
+
+  // Backward compatibility: migrate previous localStorage token once.
+  const legacyToken = window.localStorage.getItem(TOKEN_STORAGE_KEY);
+  if (legacyToken) {
+    window.sessionStorage.setItem(TOKEN_STORAGE_KEY, legacyToken);
+    window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+    return legacyToken;
+  }
+
+  return null;
+}
+
+function getStoredToken(): string | null {
+  if (!secureToken) {
+    secureToken = readTokenFromStorage();
+  }
+  return secureToken;
+}
+
+function setStoredToken(token: string | null) {
+  secureToken = token;
+  if (typeof window === "undefined") return;
+
+  if (token) {
+    window.sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
+    window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+  } else {
+    window.sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+    window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+  }
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
-  const [token, setToken] = useState<string | null>(
-    () => localStorage.getItem("docutrust_token")
-  );
+  const [token, setToken] = useState<string | null>(() => getStoredToken());
   const [isLoading, setIsLoading] = useState(true);
 
-  // On mount, verify existing token
+  // Verify existing token with retry and proper cleanup to avoid stale updates.
   useEffect(() => {
-    if (token) {
-      fetch("/api/auth/me", {
-        headers: { Authorization: `Bearer ${token}` },
-      })
-        .then((res) => {
-          if (res.ok) return res.json();
-          throw new Error("Invalid token");
-        })
-        .then((data) => setUser(data))
-        .catch(() => {
-          localStorage.removeItem("docutrust_token");
+    let isDisposed = false;
+    let retryTimeout: ReturnType<typeof setTimeout> | null = null;
+
+    const verifyTokenWithRetry = async (attemptsLeft: number, tokenToVerify: string) => {
+      if (isDisposed) return;
+
+      try {
+        const res = await fetch("/api/auth/me", {
+          headers: { Authorization: `Bearer ${tokenToVerify}` },
+        });
+
+        if (isDisposed) return;
+
+        if (res.status === 401) {
+          setStoredToken(null);
           setToken(null);
-        })
-        .finally(() => setIsLoading(false));
+          setUser(null);
+          setIsLoading(false);
+          return;
+        }
+
+        if (res.status >= 500 && attemptsLeft > 0) {
+          retryTimeout = setTimeout(() => {
+            void verifyTokenWithRetry(attemptsLeft - 1, tokenToVerify);
+          }, 1000);
+          return;
+        }
+
+        if (res.ok) {
+          const data = await res.json();
+          if (isDisposed) return;
+          setUser(data);
+          setIsLoading(false);
+          return;
+        }
+
+        setStoredToken(null);
+        setToken(null);
+        setUser(null);
+        setIsLoading(false);
+      } catch {
+        if (isDisposed) return;
+        setIsLoading(false);
+      }
+    };
+
+    if (token) {
+      void verifyTokenWithRetry(2, token);
     } else {
+      setUser(null);
       setIsLoading(false);
     }
-  }, []);
+
+    const syncTokenFromStorage = () => {
+      const nextToken = readTokenFromStorage();
+      secureToken = nextToken;
+      setToken(nextToken);
+      if (!nextToken) {
+        setUser(null);
+      }
+    };
+
+    window.addEventListener("storage", syncTokenFromStorage);
+
+    return () => {
+      isDisposed = true;
+      if (retryTimeout) clearTimeout(retryTimeout);
+      window.removeEventListener("storage", syncTokenFromStorage);
+    };
+  }, [token]);
 
   const login = async (email: string, password: string) => {
     const res = await fetch("/api/auth/login", {
@@ -81,14 +171,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     const data = await res.json();
     
-    // Step 1: Immediately save token to localStorage
-    localStorage.setItem("docutrust_token", data.token);
-    
-    // Step 2: Update state (synchronous but batched by React)
+    setStoredToken(data.token);
     setToken(data.token);
     setUser(data.user);
     
-    // Step 3: Small delay to ensure state updates are flushed to DOM
     await new Promise(resolve => setTimeout(resolve, 100));
   };
 
@@ -108,9 +194,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const logout = () => {
+    setStoredToken(null);
     setToken(null);
     setUser(null);
-    localStorage.removeItem("docutrust_token");
   };
 
   return (
