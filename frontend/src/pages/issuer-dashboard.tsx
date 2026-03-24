@@ -113,8 +113,11 @@ export default function IssuerDashboard() {
 
   useEffect(() => {
     const nextCertificates = (batchesResponse?.batches || [])
-      .map((batch) => ({ ...batch, id: batch.documentId || batch.id }))
-      .filter((batch) => !locallyDeletedCertificateIds.has(batch.id));
+      .map((batch) => ({
+      ...batch,
+      batch_id: batch.id,
+      documentId: batch.documentId, }))
+      .filter((batch) => batch.documentId && !locallyDeletedCertificateIds.has(batch.documentId));
     setCertificates(nextCertificates);
     updateStats(nextCertificates);
   }, [batchesResponse, locallyDeletedCertificateIds]);
@@ -126,7 +129,7 @@ export default function IssuerDashboard() {
   const { toast } = useToast();
 
   const handleDelete = async (id: string) => {
-    if (!certificates.find((c: any) => c.id === id) || isDeletingDocument) return;
+    if (!certificates.find((c: any) => c.documentId === id) || isDeletingDocument) return;
     const prevCertificates = certificates;
     try {
       setIsDeletingDocument(true);
@@ -139,7 +142,7 @@ export default function IssuerDashboard() {
       
       if (res.ok && data.success) {
         setCertificates((prev: any[]) => {
-          const next = prev.filter((c: any) => c.id !== id);
+          const next = prev.filter((c: any) => c.documentId !== id);
           updateStats(next);
           return next;
         });
@@ -364,7 +367,8 @@ export default function IssuerDashboard() {
                                 </AlertDialogHeader>
                                 <AlertDialogFooter className="mt-6">
                                   <AlertDialogCancel className="rounded-[8px] h-10 px-4 font-semibold border-[#e5e7eb] text-[#111827] hover:bg-[#f3f4f6]">Cancel</AlertDialogCancel>
-                                  <AlertDialogAction onClick={() => revokeMutation.mutate(batch.id)} className="rounded-[8px] h-10 px-4 bg-[#dc2626] hover:bg-[#b91c1c] text-white font-semibold flex items-center gap-2 transition-all duration-200 hover:shadow-md hover:-translate-y-0.5">
+                                  <AlertDialogAction onClick={() => {console.log("UI batch object:", batch);
+    console.log("UI sending batch.id:", batch.id);revokeMutation.mutate(batch.batch_id)}} className="rounded-[8px] h-10 px-4 bg-[#dc2626] hover:bg-[#b91c1c] text-white font-semibold flex items-center gap-2 transition-all duration-200 hover:shadow-md hover:-translate-y-0.5">
                                     Confirm Revocation
                                   </AlertDialogAction>
                                 </AlertDialogFooter>
@@ -387,7 +391,7 @@ export default function IssuerDashboard() {
                               </AlertDialogHeader>
                               <AlertDialogFooter className="mt-6">
                                 <AlertDialogCancel className="rounded-[8px] h-10 px-4 font-semibold border-[#e5e7eb] text-[#111827] hover:bg-[#f3f4f6]">Cancel</AlertDialogCancel>
-                                <AlertDialogAction onClick={() => handleDelete(batch.id)} className="rounded-[8px] h-10 px-4 bg-[#111827] hover:bg-[#000000] text-white font-semibold flex items-center gap-2 transition-all duration-200 hover:shadow-md hover:-translate-y-0.5">
+                                <AlertDialogAction onClick={() => handleDelete(batch.documentId)} className="rounded-[8px] h-10 px-4 bg-[#111827] hover:bg-[#000000] text-white font-semibold flex items-center gap-2 transition-all duration-200 hover:shadow-md hover:-translate-y-0.5">
                                   Delete
                                 </AlertDialogAction>
                               </AlertDialogFooter>

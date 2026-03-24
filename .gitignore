@@ -7,3 +7,5 @@ vite.config.ts.*
 .env
 .env.*
 !.env.example
+CODE_AUDIT_REPORT.md
+cleanup.sh

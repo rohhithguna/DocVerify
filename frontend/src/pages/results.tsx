@@ -180,9 +180,6 @@ export default function ResultsPage() {
                 }}>
                   {isVerified ? "Verified" : "Failed"}
                 </span>
-                <span style={{ fontSize: 22 }}>
-                  {isVerified ? "✅" : "❌"}
-                </span>
               </div>
               <span style={{
                 fontSize: 12, fontWeight: 500,
